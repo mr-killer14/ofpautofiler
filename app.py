@@ -1,5 +1,5 @@
 import streamlit as st
-import fitz  # PyMuPDF : La bibliothèque la plus performante pour lire et éditer des PDF
+import fitz  # PyMuPDF
 import json
 import io
 from groq import Groq
@@ -13,30 +13,20 @@ st.set_page_config(page_title="C525 Smart OFP Assistant", layout="wide", page_ic
 
 def extract_text_from_fp(fp_file):
     """
-    Objectif : Extraire le texte du Flight Package sans saturer la mémoire du serveur.
-    Problème résolu : Un FP contient souvent >100 pages de NOTAMs inutiles pour les perfos.
-    Méthode : On lit uniquement les 15 premières pages (Météo/Route) et les 15 dernières (APG).
-    
-    Args:
-        fp_file: Le fichier PDF uploadé via Streamlit.
-    Returns:
-        String: Le texte brut concaténé et nettoyé des pages sélectionnées.
+    Extrait le texte utile du Flight Package sans saturer la mémoire.
+    Lit les 15 premières pages (Météo/Route) et les 15 dernières (APG),
+    en ignorant le bloc central de NOTAMs.
     """
     doc_fp = fitz.open(stream=fp_file.read(), filetype="pdf")
     total_pages = len(doc_fp)
     
-    # Création d'une liste des pages à lire (0 à 14)
     pages_to_read = list(range(min(15, total_pages)))
-    
-    # Si le document est très long, on ajoute les 15 dernières pages (pour récupérer l'APG)
     if total_pages > 30:
         pages_to_read += list(range(total_pages - 15, total_pages))
         
-    # Extraction du texte en ignorant les doublons
     fp_text = " ".join([doc_fp[i].get_text() for i in set(pages_to_read)])
     doc_fp.close()
     
-    # Nettoyage des espaces et retours à la ligne superflus pour optimiser le prompt IA
     fp_text = " ".join(fp_text.split())
     return fp_text
 
@@ -46,15 +36,7 @@ def extract_text_from_fp(fp_file):
 
 def extract_data_with_ai(fp_text, wb_text, api_key):
     """
-    Objectif : Utiliser l'IA (Llama 3.1 via Groq) pour extraire les valeurs clés.
-    Avantage : Traitement ultra-rapide et gratuit, insensible aux quotas de Gemini.
-    
-    Args:
-        fp_text (str): Le texte brut du Flight Package.
-        wb_text (str): Le texte brut du Weight & Balance.
-        api_key (str): La clé API Groq secrète.
-    Returns:
-        Dict: Un dictionnaire Python contenant toutes les valeurs, ou None si échec.
+    Extrait les données clés de vol au format JSON structuré via Groq (Llama 3.3).
     """
     client = Groq(api_key=api_key)
     
@@ -87,14 +69,12 @@ def extract_data_with_ai(fp_text, wb_text, api_key):
     """
     
     try:
-        # Appel à l'API Groq (Modèle Llama 3.1 70B pour une précision maximale)
         chat_completion = client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
-            model="llama-3.1-70b-versatile",
-            temperature=0, # 0 = 100% factuel, aucune hallucination
+            model="llama-3.3-70b-versatile",
+            temperature=0,
         )
         
-        # Nettoyage et formatage du JSON retourné
         response_text = chat_completion.choices[0].message.content
         json_str = response_text.replace("```json", "").replace("```", "").strip()
         return json.loads(json_str)
@@ -129,7 +109,7 @@ def draw_text_above(page, keyword, text, offset_x=0, offset_y=-15, font="hebo", 
 
 def draw_on_pdf(template_bytes, ai_data, user_params):
     """
-    Objectif : Appliquer les données extraites par l'IA et les choix du pilote sur l'OFP vierge.
+    Applique les données extraites et les choix équipage sur l'OFP PPS vierge.
     """
     doc = fitz.open(stream=template_bytes, filetype="pdf")
     red_color = (1, 0, 0)
@@ -137,7 +117,7 @@ def draw_on_pdf(template_bytes, ai_data, user_params):
     # ------------------ PAGE 1 : EN-TÊTE ET PERFORMANCES ------------------
     p1 = doc[0]
     
-    # 1. Écriture des données (Ancrage sur les étiquettes existantes)
+    # 1. Écriture des données chiffrées
     draw_text_next_to(p1, "T/O POWER:", ai_data.get("to_power", ""))
     draw_text_next_to(p1, "RUNWAY:", ai_data.get("runway", ""))
     draw_text_next_to(p1, "TO WEIGHT:", ai_data.get("tow", ""))
@@ -147,7 +127,7 @@ def draw_on_pdf(template_bytes, ai_data, user_params):
     draw_text_next_to(p1, "(DEST/ALTN):", ai_data.get("max_ldg", ""))
     draw_text_above(p1, "UPDATE:", f"WB: Landing Weight {ai_data.get('landing_weight', '')}")
 
-    # 2. Dessin de l'Escape Route (Insertion d'une boîte de texte multiligne)
+    # 2. Dessin de l'Escape Route
     if ai_data.get("escape_route"):
         rects = p1.search_for("1E0 ESCAPE PROCEDURE:")
         if rects:
@@ -158,7 +138,7 @@ def draw_on_pdf(template_bytes, ai_data, user_params):
     # 3. Encadrer le Type d'Ops (COM/PVT/TRG/MED)
     ops_rects = p1.search_for(user_params["ops"])
     for r in ops_rects:
-        if r.y0 < 300: # Sécurise pour n'encadrer que l'en-tête, pas d'éventuels NOTAMs
+        if r.y0 < 300:
             p1.draw_rect(fitz.Rect(r.x0 - 2, r.y0 - 2, r.x1 + 2, r.y1 + 2), color=red_color, width=1.5, radius=2)
 
     # 4. Encadrer dynamiquement le PF (Pilot Flying) et PM (Pilot Monitoring)
@@ -188,11 +168,11 @@ def draw_on_pdf(template_bytes, ai_data, user_params):
     if len(doc) > 1:
         p2 = doc[1]
         
-        # 5. Drift Down (Aligné à droite de la mention -TOC-)
+        # 5. Drift Down
         if user_params.get("driftdown_fl"):
             draw_text_next_to(p2, "-TOC-", f"DD: FL {user_params['driftdown_fl']}", offset_x=15, color=red_color)
 
-        # 6. Recherche et calcul de la Recovery Altitude (Basé sur la plus haute MORA)
+        # 6. Recovery Altitude calculée sur la plus haute MORA
         words = p2.get_text("words")
         max_mora, max_mora_rect = 0, None
         for w in words:
@@ -206,7 +186,6 @@ def draw_on_pdf(template_bytes, ai_data, user_params):
             recovery_alt = (max_mora * 100) + 1000
             p2.insert_text((max_mora_rect.x1 + 20, max_mora_rect.y1), f"Rec: {recovery_alt} FT", fontsize=10, fontname="hebo", color=red_color)
 
-    # ------------------ EXPORTATION ------------------
     output = io.BytesIO()
     doc.save(output)
     doc.close()
@@ -235,10 +214,8 @@ with col_ops:
 with col_dd: 
     driftdown_fl = st.text_input("Drift Down FL :", placeholder="ex: 220")
 
-# Bouton de lancement
 if st.button("🚀 Analyser avec l'IA & Compléter l'OFP", type="primary", use_container_width=True):
     
-    # Validation de la clé API Groq
     try:
         api_key = st.secrets["GROQ_API_KEY"]
     except Exception:
@@ -251,15 +228,16 @@ if st.button("🚀 Analyser avec l'IA & Compléter l'OFP", type="primary", use_c
     else:
         with st.spinner("Extraction, analyse sémantique (Groq IA) et tracé géométrique en cours..."):
             
-            # --- Étape A : Lecture des fichiers PDF ---
+            # Lecture du W&B
             doc_wb = fitz.open(stream=wb_file.read(), filetype="pdf")
             wb_text = " ".join([page.get_text() for page in doc_wb])
             wb_text = " ".join(wb_text.split())
             doc_wb.close()
             
+            # Lecture du Flight Package
             fp_text = extract_text_from_fp(fp_file)
 
-            # --- Étape B : Intelligence Artificielle ---
+            # Extraction IA
             ai_data = extract_data_with_ai(fp_text, wb_text, api_key)
 
             if ai_data:
@@ -268,13 +246,12 @@ if st.button("🚀 Analyser avec l'IA & Compléter l'OFP", type="primary", use_c
                 with st.expander("🔍 Vérifier les données brutes extraites"):
                     st.json(ai_data)
                 
-                # --- Étape C : Tracé final ---
+                # Tracé final
                 user_params = {"pf": pf, "ops": ops, "driftdown_fl": driftdown_fl}
                 template_bytes = template_file.read()
-                
                 final_pdf = draw_on_pdf(template_bytes, ai_data, user_params)
 
-                # --- Étape D : Téléchargement ---
+                # Téléchargement
                 st.download_button(
                     label="📥 Télécharger l'OFP Complété pour le vol",
                     data=final_pdf,
