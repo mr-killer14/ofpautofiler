@@ -41,7 +41,6 @@ def extract_data_with_ai(fp_text, wb_text, api_key):
     client = Groq(api_key=api_key)
     
     try:
-        # 1. Récupération dynamique de la liste des modèles actifs
         models_data = client.models.list().data
         active_models = [
             m.id for m in models_data 
@@ -52,7 +51,6 @@ def extract_data_with_ai(fp_text, wb_text, api_key):
             st.error("❌ Aucun modèle de génération textuelle disponible sur ce compte Groq.")
             return None
 
-        # 2. Sélection prioritaire (Llama 3.x, Mixtral ou premier disponible)
         selected_model = active_models[0]
         for m_id in active_models:
             if "llama-3" in m_id.lower():
@@ -63,7 +61,6 @@ def extract_data_with_ai(fp_text, wb_text, api_key):
                 
         st.info(f"🤖 Modèle sélectionné sur votre compte Groq : `{selected_model}`")
 
-        # 3. Prompt structuré
         prompt = f"""
         Tu es un dispatcher aéronautique expert. Analyse ces documents de vol brut (Flight Package contenant Météo et Perfos APG, et une Loadsheet).
         Extrais les informations exactes demandées en format JSON pur.
@@ -92,7 +89,6 @@ def extract_data_with_ai(fp_text, wb_text, api_key):
         }}
         """
         
-        # 4. Requête d'inférence
         chat_completion = client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
             model=selected_model,
@@ -144,9 +140,14 @@ def draw_on_pdf(template_bytes, ai_data, user_params):
     draw_text_next_to(p1, "TO WEIGHT:", ai_data.get("tow", ""))
     draw_text_next_to(p1, "OBST/ST LIMIT:", ai_data.get("obst_limit", ""))
     draw_text_next_to(p1, "LVL OFF:", ai_data.get("lvl_off", ""))
-    draw_text_next_to(p1, "RMQ:", f"ZFW: {ai_data.get('zfw', '')}")
+    
+    if ai_data.get("zfw"):
+        draw_text_next_to(p1, "RMQ:", f"ZFW: {ai_data.get('zfw')}")
+        
     draw_text_next_to(p1, "(DEST/ALTN):", ai_data.get("max_ldg", ""))
-    draw_text_above(p1, "UPDATE:", f"WB: Landing Weight {ai_data.get('landing_weight', '')}")
+    
+    if ai_data.get("landing_weight"):
+        draw_text_above(p1, "UPDATE:", f"WB: Landing Weight {ai_data.get('landing_weight')}")
 
     if ai_data.get("escape_route"):
         rects = p1.search_for("1E0 ESCAPE PROCEDURE:")
@@ -155,11 +156,13 @@ def draw_on_pdf(template_bytes, ai_data, user_params):
             text_rect = fitz.Rect(r.x0, r.y1 + 5, r.x0 + 350, r.y1 + 80)
             p1.insert_textbox(text_rect, ai_data["escape_route"], fontsize=8, fontname="helv", align=0)
 
+    # Encadrement du type d'opération (sans radius)
     ops_rects = p1.search_for(user_params["ops"])
     for r in ops_rects:
         if r.y0 < 300:
-            p1.draw_rect(fitz.Rect(r.x0 - 2, r.y0 - 2, r.x1 + 2, r.y1 + 2), color=red_color, width=1.5, radius=2)
+            p1.draw_rect(fitz.Rect(r.x0 - 2, r.y0 - 2, r.x1 + 2, r.y1 + 2), color=red_color, width=1.5)
 
+    # Encadrement du PF et PM (sans radius)
     pf_pm_rects = p1.search_for("PF-PM")
     pf_pm_rects = sorted([r for r in pf_pm_rects if 600 < r.y0 < 750], key=lambda x: x.x0)
     
@@ -167,20 +170,20 @@ def draw_on_pdf(template_bytes, ai_data, user_params):
         cpt_rect = pf_pm_rects[0]
         fo_rect = pf_pm_rects[1]
 
-        def draw_circle(r, role):
+        def draw_box(r, role):
             w = r.x1 - r.x0
             if role == "PF": 
                 box = fitz.Rect(r.x0 - 2, r.y0 - 2, r.x0 + w/2, r.y1 + 2)
             else: 
                 box = fitz.Rect(r.x0 + w/2, r.y0 - 2, r.x1 + 2, r.y1 + 2)
-            p1.draw_rect(box, color=red_color, width=1.5, radius=3)
+            p1.draw_rect(box, color=red_color, width=1.5)
 
         if user_params["pf"] == "CPT":
-            draw_circle(cpt_rect, "PF")
-            draw_circle(fo_rect, "PM")
+            draw_box(cpt_rect, "PF")
+            draw_box(fo_rect, "PM")
         else:
-            draw_circle(cpt_rect, "PM")
-            draw_circle(fo_rect, "PF")
+            draw_box(cpt_rect, "PM")
+            draw_box(fo_rect, "PF")
 
     # --- PAGE 2 : ROUTE & MORA ---
     if len(doc) > 1:
