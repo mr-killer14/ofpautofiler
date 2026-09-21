@@ -4,7 +4,6 @@ import json
 import io
 from groq import Groq
 
-# Configuration de base de la page web Streamlit
 st.set_page_config(page_title="C525 Smart OFP Assistant", layout="wide", page_icon="✈️")
 
 # =====================================================================
@@ -31,51 +30,75 @@ def extract_text_from_fp(fp_file):
     return fp_text
 
 # =====================================================================
-# SECTION 2 : ANALYSE INTELLIGENTE VIA GROQ (TEXTE -> JSON)
+# SECTION 2 : ANALYSE INTELLIGENTE VIA GROQ (MODÈLE DYNAMIQUE)
 # =====================================================================
 
 def extract_data_with_ai(fp_text, wb_text, api_key):
     """
-    Extrait les données clés de vol au format JSON structuré via Groq (Llama 3.3).
+    Détecte automatiquement les modèles actifs sur le compte Groq
+    et extrait les données de vol en JSON pur.
     """
     client = Groq(api_key=api_key)
     
-    prompt = f"""
-    Tu es un dispatcher aéronautique expert. Analyse ces documents de vol brut (Flight Package contenant Météo et Perfos APG, et une Loadsheet).
-    Extrais les informations exactes demandées en format JSON pur.
-    
-    Règles strictes d'extraction :
-    - tow : masse au décollage RÉELLE (pas la structurelle Max).
-    - zfw : zero fuel weight RÉEL (pas la structurelle Max).
-    - landing_weight : landing weight RÉEL (pas la structurelle Max).
-    - to_power : la puissance de décollage (ex: 98.6%) correspondant à la température OAT du METAR de départ et à la bonne piste.
-    - obst_limit : la masse limite d'obstacle APG pour le décollage.
-    - lvl_off : l'altitude de Level Off APG en cas de panne moteur.
-    - runway : la piste de décollage utilisée dans l'APG.
-    - escape_route : le texte de la SPECIAL DEPARTURE PROCEDURE (NOTE: NON-RNAV PROCEDURE...).
-    - max_ldg : sous la forme "DEST/ALTN" (ex: "9900/9900"), en utilisant les perfos APG "LANDING PERFORMANCE" adaptées aux METAR (Dry ou Wet).
-    
-    TEXTE FLIGHT PACKAGE & APG :
-    {fp_text[:8000]} 
-    
-    TEXTE WEIGHT & BALANCE :
-    {wb_text[:2000]}
-    
-    Réponds UNIQUEMENT avec ce format JSON strict (n'ajoute aucun commentaire ni balise markdown) :
-    {{
-        "tow": "", "zfw": "", "landing_weight": "", "to_power": "",
-        "obst_limit": "", "lvl_off": "", "runway": "", "escape_route": "", "max_ldg": ""
-    }}
-    """
-    
     try:
+        # 1. Récupération dynamique de la liste des modèles actifs
+        models_data = client.models.list().data
+        active_models = [
+            m.id for m in models_data 
+            if "whisper" not in m.id.lower() and "guard" not in m.id.lower()
+        ]
+        
+        if not active_models:
+            st.error("❌ Aucun modèle de génération textuelle disponible sur ce compte Groq.")
+            return None
+
+        # 2. Sélection prioritaire (Llama 3.x, Mixtral ou premier disponible)
+        selected_model = active_models[0]
+        for m_id in active_models:
+            if "llama-3" in m_id.lower():
+                selected_model = m_id
+                break
+            elif "mixtral" in m_id.lower():
+                selected_model = m_id
+                
+        st.info(f"🤖 Modèle sélectionné sur votre compte Groq : `{selected_model}`")
+
+        # 3. Prompt structuré
+        prompt = f"""
+        Tu es un dispatcher aéronautique expert. Analyse ces documents de vol brut (Flight Package contenant Météo et Perfos APG, et une Loadsheet).
+        Extrais les informations exactes demandées en format JSON pur.
+        
+        Règles strictes d'extraction :
+        - tow : masse au décollage RÉELLE (pas la structurelle Max).
+        - zfw : zero fuel weight RÉEL (pas la structurelle Max).
+        - landing_weight : landing weight RÉEL (pas la structurelle Max).
+        - to_power : la puissance de décollage (ex: 98.6%) correspondant à la température OAT du METAR de départ et à la bonne piste.
+        - obst_limit : la masse limite d'obstacle APG pour le décollage.
+        - lvl_off : l'altitude de Level Off APG en cas de panne moteur.
+        - runway : la piste de décollage utilisée dans l'APG.
+        - escape_route : le texte de la SPECIAL DEPARTURE PROCEDURE (NOTE: NON-RNAV PROCEDURE...).
+        - max_ldg : sous la forme "DEST/ALTN" (ex: "9900/9900"), en utilisant les perfos APG "LANDING PERFORMANCE" adaptées aux METAR (Dry ou Wet).
+        
+        TEXTE FLIGHT PACKAGE & APG :
+        {fp_text[:8000]} 
+        
+        TEXTE WEIGHT & BALANCE :
+        {wb_text[:2000]}
+        
+        Réponds UNIQUEMENT avec ce format JSON strict (n'ajoute aucun commentaire ni balise markdown) :
+        {{
+            "tow": "", "zfw": "", "landing_weight": "", "to_power": "",
+            "obst_limit": "", "lvl_off": "", "runway": "", "escape_route": "", "max_ldg": ""
+        }}
+        """
+        
+        # 4. Requête d'inférence
         chat_completion = client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
-            model="llama-3.1-8b-instant",
+            model=selected_model,
             temperature=0,
-            response_format={"type": "json_object"},
         )
-
+        
         response_text = chat_completion.choices[0].message.content
         json_str = response_text.replace("```json", "").replace("```", "").strip()
         return json.loads(json_str)
@@ -109,16 +132,13 @@ def draw_text_above(page, keyword, text, offset_x=0, offset_y=-15, font="hebo", 
 # =====================================================================
 
 def draw_on_pdf(template_bytes, ai_data, user_params):
-    """
-    Applique les données extraites et les choix équipage sur l'OFP PPS vierge.
-    """
+    """Applique les données extraites et les choix d'équipage sur l'OFP PPS vierge."""
     doc = fitz.open(stream=template_bytes, filetype="pdf")
     red_color = (1, 0, 0)
     
-    # ------------------ PAGE 1 : EN-TÊTE ET PERFORMANCES ------------------
+    # --- PAGE 1 : EN-TÊTE ET PERFORMANCES ---
     p1 = doc[0]
     
-    # 1. Écriture des données chiffrées
     draw_text_next_to(p1, "T/O POWER:", ai_data.get("to_power", ""))
     draw_text_next_to(p1, "RUNWAY:", ai_data.get("runway", ""))
     draw_text_next_to(p1, "TO WEIGHT:", ai_data.get("tow", ""))
@@ -128,7 +148,6 @@ def draw_on_pdf(template_bytes, ai_data, user_params):
     draw_text_next_to(p1, "(DEST/ALTN):", ai_data.get("max_ldg", ""))
     draw_text_above(p1, "UPDATE:", f"WB: Landing Weight {ai_data.get('landing_weight', '')}")
 
-    # 2. Dessin de l'Escape Route
     if ai_data.get("escape_route"):
         rects = p1.search_for("1E0 ESCAPE PROCEDURE:")
         if rects:
@@ -136,13 +155,11 @@ def draw_on_pdf(template_bytes, ai_data, user_params):
             text_rect = fitz.Rect(r.x0, r.y1 + 5, r.x0 + 350, r.y1 + 80)
             p1.insert_textbox(text_rect, ai_data["escape_route"], fontsize=8, fontname="helv", align=0)
 
-    # 3. Encadrer le Type d'Ops (COM/PVT/TRG/MED)
     ops_rects = p1.search_for(user_params["ops"])
     for r in ops_rects:
         if r.y0 < 300:
             p1.draw_rect(fitz.Rect(r.x0 - 2, r.y0 - 2, r.x1 + 2, r.y1 + 2), color=red_color, width=1.5, radius=2)
 
-    # 4. Encadrer dynamiquement le PF (Pilot Flying) et PM (Pilot Monitoring)
     pf_pm_rects = p1.search_for("PF-PM")
     pf_pm_rects = sorted([r for r in pf_pm_rects if 600 < r.y0 < 750], key=lambda x: x.x0)
     
@@ -165,15 +182,13 @@ def draw_on_pdf(template_bytes, ai_data, user_params):
             draw_circle(cpt_rect, "PM")
             draw_circle(fo_rect, "PF")
 
-    # ------------------ PAGE 2 : ROUTE & MORA ------------------
+    # --- PAGE 2 : ROUTE & MORA ---
     if len(doc) > 1:
         p2 = doc[1]
         
-        # 5. Drift Down
         if user_params.get("driftdown_fl"):
             draw_text_next_to(p2, "-TOC-", f"DD: FL {user_params['driftdown_fl']}", offset_x=15, color=red_color)
 
-        # 6. Recovery Altitude calculée sur la plus haute MORA
         words = p2.get_text("words")
         max_mora, max_mora_rect = 0, None
         for w in words:
@@ -200,11 +215,11 @@ def draw_on_pdf(template_bytes, ai_data, user_params):
 st.markdown("### 🛫 Documents de vol sources")
 col1, col2, col3 = st.columns(3)
 with col1: 
-    fp_file = st.file_uploader("1. Flight Package (PDF)", type="pdf", help="Le FP complet avec Météo et APG.")
+    fp_file = st.file_uploader("1. Flight Package (PDF)", type="pdf")
 with col2: 
-    wb_file = st.file_uploader("2. Weight & Balance (PDF)", type="pdf", help="La Loadsheet finale.")
+    wb_file = st.file_uploader("2. Weight & Balance (PDF)", type="pdf")
 with col3: 
-    template_file = st.file_uploader("3. OFP PPS (PDF)", type="pdf", help="L'OFP pré-rempli par le système à compléter.")
+    template_file = st.file_uploader("3. OFP PPS (PDF)", type="pdf")
 
 st.markdown("### ⚙️ Paramètres du vol")
 col_pf, col_ops, col_dd = st.columns(3)
@@ -220,41 +235,33 @@ if st.button("🚀 Analyser avec l'IA & Compléter l'OFP", type="primary", use_c
     try:
         api_key = st.secrets["GROQ_API_KEY"]
     except Exception:
-        st.error("⚠️ La clé API Groq n'est pas configurée.")
-        st.info("Ajoutez 'GROQ_API_KEY = \"votre_cle\"' dans les Secrets de Streamlit.")
+        st.error("⚠️ Clé GROQ_API_KEY absente des Secrets Streamlit.")
         st.stop()
 
     if not (fp_file and wb_file and template_file):
         st.warning("⚠️ Veuillez charger les 3 documents PDF avant de lancer l'analyse.")
     else:
-        with st.spinner("Extraction, analyse sémantique (Groq IA) et tracé géométrique en cours..."):
-            
-            # Lecture du W&B
+        with st.spinner("Analyse et tracé en cours..."):
             doc_wb = fitz.open(stream=wb_file.read(), filetype="pdf")
             wb_text = " ".join([page.get_text() for page in doc_wb])
             wb_text = " ".join(wb_text.split())
             doc_wb.close()
             
-            # Lecture du Flight Package
             fp_text = extract_text_from_fp(fp_file)
 
-            # Extraction IA
             ai_data = extract_data_with_ai(fp_text, wb_text, api_key)
 
             if ai_data:
-                st.success("✅ Données extraites de l'APG et du W&B avec succès !")
-                
+                st.success("✅ Analyse terminée avec succès.")
                 with st.expander("🔍 Vérifier les données brutes extraites"):
                     st.json(ai_data)
                 
-                # Tracé final
                 user_params = {"pf": pf, "ops": ops, "driftdown_fl": driftdown_fl}
                 template_bytes = template_file.read()
                 final_pdf = draw_on_pdf(template_bytes, ai_data, user_params)
 
-                # Téléchargement
                 st.download_button(
-                    label="📥 Télécharger l'OFP Complété pour le vol",
+                    label="📥 Télécharger l'OFP Complété",
                     data=final_pdf,
                     file_name="OFP_Smart_Complete.pdf",
                     mime="application/pdf",
