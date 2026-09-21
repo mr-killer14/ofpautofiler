@@ -205,13 +205,29 @@ if st.button("🚀 Analyser avec l'IA & Générer l'OFP", type="primary", use_co
     if not (fp_file and wb_file and template_file):
         st.warning("⚠️ Veuillez charger les 3 documents PDF.")
     else:
-        with st.spinner("L'IA analyse vos documents (Météo, W&B, APG)..."):
+       with st.spinner("L'IA analyse vos documents (Météo, W&B, APG)..."):
             
-            # Extraction des textes bruts
-            with pdfplumber.open(wb_file) as pdf:
-                wb_text = " ".join([p.extract_text() for p in pdf.pages if p.extract_text()])
-            with pdfplumber.open(fp_file) as pdf:
-                fp_text = " ".join([p.extract_text() for p in pdf.pages if p.extract_text()])
+            # 1. Lecture ultra-rapide du W&B avec PyMuPDF
+            doc_wb = fitz.open(stream=wb_file.read(), filetype="pdf")
+            wb_text = " ".join([page.get_text() for page in doc_wb])
+            doc_wb.close()
+            wb_file.seek(0) # Réinitialise le fichier pour ne pas le bloquer
+
+            # 2. Lecture ciblée du Flight Package (Saut des NOTAMs)
+            doc_fp = fitz.open(stream=fp_file.read(), filetype="pdf")
+            total_pages = len(doc_fp)
+            
+            # On sélectionne les 15 premières pages (Météo/OFP) et les 15 dernières (APG)
+            pages_to_read = list(range(min(15, total_pages)))
+            if total_pages > 30:
+                pages_to_read += list(range(total_pages - 15, total_pages))
+            
+            fp_text = " ".join([doc_fp[i].get_text() for i in set(pages_to_read)])
+            doc_fp.close()
+            fp_file.seek(0)
+
+            # 3. Appel à l'IA
+            ai_data = extract_data_with_ai(fp_text, wb_text, api_key)
 
             # Analyse via l'IA
             ai_data = extract_data_with_ai(fp_text, wb_text, api_key)
