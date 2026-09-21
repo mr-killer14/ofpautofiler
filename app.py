@@ -55,7 +55,25 @@ def extract_data_with_ai(fp_text, wb_text, api_key):
     except Exception as e:
         st.error(f"Erreur de l'IA : {str(e)}")
         return None
-
+# Appel à l'IA avec gestion automatique du quota
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                response = model.generate_content(prompt)
+                json_str = response.text.replace("```json", "").replace("```", "").strip()
+                return json.loads(json_str)
+            except Exception as e:
+                erreur = str(e)
+                # Si on détecte une erreur de quota (429), on met le code en pause
+                if "429" in erreur or "quota" in erreur.lower():
+                    if attempt < max_retries - 1:
+                        st.warning(f"⏳ Quota IA temporairement atteint. Pause automatique de 36 secondes avant la relance...")
+                        time.sleep(36)
+                        continue
+                
+                # Si c'est une autre erreur, on l'affiche et on arrête
+                st.error(f"Erreur de l'IA : {erreur}")
+                return None
 # ==========================================
 # 2. FONCTIONS DE DESSIN PAR ANCRAGE (PyMuPDF)
 # ==========================================
