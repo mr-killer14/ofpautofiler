@@ -11,11 +11,6 @@ st.set_page_config(page_title="C525 Smart OFP Assistant", layout="wide", page_ic
 # =====================================================================
 
 def extract_text_from_fp(fp_file):
-    """
-    Extrait le texte utile du Flight Package sans saturer la mémoire.
-    Lit les 15 premières pages (Météo/Route) et les 15 dernières (APG),
-    en ignorant le bloc central de NOTAMs.
-    """
     doc_fp = fitz.open(stream=fp_file.read(), filetype="pdf")
     total_pages = len(doc_fp)
     
@@ -30,25 +25,19 @@ def extract_text_from_fp(fp_file):
     return fp_text
 
 # =====================================================================
-# SECTION 2 : ANALYSE INTELLIGENTE VIA GROQ (MODÈLE DYNAMIQUE)
+# SECTION 2 : ANALYSE INTELLIGENTE VIA GROQ (CHAIN OF THOUGHT)
 # =====================================================================
 
 def extract_data_with_ai(fp_text, wb_text, api_key):
-    """
-    Détecte automatiquement les modèles actifs sur le compte Groq
-    et extrait les données de vol en JSON pur.
-    """
     client = Groq(api_key=api_key)
     
     try:
+        # Récupération dynamique du modèle
         models_data = client.models.list().data
-        active_models = [
-            m.id for m in models_data 
-            if "whisper" not in m.id.lower() and "guard" not in m.id.lower()
-        ]
+        active_models = [m.id for m in models_data if "whisper" not in m.id.lower() and "guard" not in m.id.lower()]
         
         if not active_models:
-            st.error("❌ Aucun modèle de génération textuelle disponible sur ce compte Groq.")
+            st.error("❌ Aucun modèle disponible sur ce compte Groq.")
             return None
 
         selected_model = active_models[0]
@@ -56,36 +45,39 @@ def extract_data_with_ai(fp_text, wb_text, api_key):
             if "llama-3" in m_id.lower():
                 selected_model = m_id
                 break
-            elif "mixtral" in m_id.lower():
-                selected_model = m_id
                 
-        st.info(f"🤖 Modèle sélectionné sur votre compte Groq : `{selected_model}`")
-
+        # Le Prompt intègre maintenant une logique de "Reasoning" stricte
         prompt = f"""
-        Tu es un dispatcher aéronautique expert. Analyse ces documents de vol brut (Flight Package contenant Météo et Perfos APG, et une Loadsheet).
-        Extrais les informations exactes demandées en format JSON pur.
+        Tu es un dispatcher aéronautique expert. Tu vas analyser un Flight Package (Météo + APG) et un Weight & Balance (Loadsheet).
         
-        Règles strictes d'extraction :
-        - tow : masse au décollage RÉELLE (pas la structurelle Max).
-        - zfw : zero fuel weight RÉEL (pas la structurelle Max).
-        - landing_weight : landing weight RÉEL (pas la structurelle Max).
-        - to_power : la puissance de décollage (ex: 98.6%) correspondant à la température OAT du METAR de départ et à la bonne piste.
-        - obst_limit : la masse limite d'obstacle APG pour le décollage.
-        - lvl_off : l'altitude de Level Off APG en cas de panne moteur.
-        - runway : la piste de décollage utilisée dans l'APG.
-        - escape_route : le texte de la SPECIAL DEPARTURE PROCEDURE (NOTE: NON-RNAV PROCEDURE...).
-        - max_ldg : sous la forme "DEST/ALTN" (ex: "9900/9900"), en utilisant les perfos APG "LANDING PERFORMANCE" adaptées aux METAR (Dry ou Wet).
-        
-        TEXTE FLIGHT PACKAGE & APG :
+        MÉTHODE OBLIGATOIRE (Étape par étape) :
+        1. DÉPART : Analyse le METAR du départ. Note le vent et la température (OAT). Détermine si la piste est DRY ou WET (pluie). Choisis la meilleure piste face au vent.
+        2. PERFOS DÉPART (APG) : Va dans le tableau APG de cette piste et état (DRY/WET). Trouve la ligne exacte de la température (OAT).
+           - Extrais le "T/O Power" (ex: 98.6).
+           - Extrais la masse limite. Indique si elle est limitée par les obstacles (OBST) ou la piste/structure (ST).
+           - Extrais le Level Off (LVL OFF).
+        3. MASSES (W&B) : Extrais les valeurs EXACTES lues sur le document Weight & Balance : TOW (Take-Off Weight), ZFW (Zero Fuel Weight) et Landing Weight.
+        4. ARRIVÉE (DEST/ALTN) : Regarde les METAR/TAF pour la Destination et le Dégagement. Détermine si les pistes seront DRY ou WET. Va dans l'APG Landing et déduis le Max Landing Weight autorisé. Formatte en "DEST/ALTN" (ex: 9900/9900).
+
+        DOCUMENTS FOURNIS :
+        --- FLIGHT PACKAGE & APG ---
         {fp_text[:8000]} 
         
-        TEXTE WEIGHT & BALANCE :
+        --- WEIGHT & BALANCE ---
         {wb_text[:2000]}
         
-        Réponds UNIQUEMENT avec ce format JSON strict (n'ajoute aucun commentaire ni balise markdown) :
+        RÉPONSE ATTENDUE : Un objet JSON STRICT. Le champ "reasoning" doit contenir ton analyse.
         {{
-            "tow": "", "zfw": "", "landing_weight": "", "to_power": "",
-            "obst_limit": "", "lvl_off": "", "runway": "", "escape_route": "", "max_ldg": ""
+            "reasoning": "Ton analyse complète (METAR, Pistes, OAT, DRY/WET...)",
+            "tow": "Valeur exacte du W&B",
+            "zfw": "Valeur exacte du W&B",
+            "landing_weight": "Valeur exacte du W&B",
+            "to_power": "Puissance déduite de l'APG selon l'OAT",
+            "obst_or_st_limiting": "OBST ou ST (lequel te limite ?)",
+            "limiting_weight": "Valeur de la masse limite déduite",
+            "lvl_off": "Valeur APG",
+            "escape_route": "Texte de la special departure procedure (si applicable)",
+            "max_ldg": "Valeur DEST/ALTN (ex: 9900/9900)"
         }}
         """
         
@@ -93,11 +85,11 @@ def extract_data_with_ai(fp_text, wb_text, api_key):
             messages=[{"role": "user", "content": prompt}],
             model=selected_model,
             temperature=0,
+            response_format={"type": "json_object"}
         )
         
         response_text = chat_completion.choices[0].message.content
-        json_str = response_text.replace("```json", "").replace("```", "").strip()
-        return json.loads(json_str)
+        return json.loads(response_text)
         
     except Exception as e:
         st.error(f"Erreur lors de l'analyse IA (Groq) : {str(e)}")
@@ -108,7 +100,6 @@ def extract_data_with_ai(fp_text, wb_text, api_key):
 # =====================================================================
 
 def draw_text_next_to(page, keyword, text, offset_x=5, offset_y=0, font="hebo", size=10, color=(0,0,0)):
-    """Trouve un mot-clé sur la page et écrit la donnée juste à sa droite."""
     if not text: return
     rects = page.search_for(keyword)
     if rects:
@@ -116,7 +107,6 @@ def draw_text_next_to(page, keyword, text, offset_x=5, offset_y=0, font="hebo", 
         page.insert_text((r.x1 + offset_x, r.y1 + offset_y), str(text), fontsize=size, fontname=font, color=color)
 
 def draw_text_above(page, keyword, text, offset_x=0, offset_y=-15, font="hebo", size=10, color=(0,0,0)):
-    """Trouve un mot-clé sur la page et écrit la donnée juste au-dessus."""
     if not text: return
     rects = page.search_for(keyword)
     if rects:
@@ -128,27 +118,50 @@ def draw_text_above(page, keyword, text, offset_x=0, offset_y=-15, font="hebo", 
 # =====================================================================
 
 def draw_on_pdf(template_bytes, ai_data, user_params):
-    """Applique les données extraites et les choix d'équipage sur l'OFP PPS vierge."""
     doc = fitz.open(stream=template_bytes, filetype="pdf")
     red_color = (1, 0, 0)
     
     # --- PAGE 1 : EN-TÊTE ET PERFORMANCES ---
     p1 = doc[0]
     
+    # 1. Textes classiques
     draw_text_next_to(p1, "T/O POWER:", ai_data.get("to_power", ""))
-    draw_text_next_to(p1, "RUNWAY:", ai_data.get("runway", ""))
     draw_text_next_to(p1, "TO WEIGHT:", ai_data.get("tow", ""))
-    draw_text_next_to(p1, "OBST/ST LIMIT:", ai_data.get("obst_limit", ""))
     draw_text_next_to(p1, "LVL OFF:", ai_data.get("lvl_off", ""))
     
     if ai_data.get("zfw"):
         draw_text_next_to(p1, "RMQ:", f"ZFW: {ai_data.get('zfw')}")
         
-    draw_text_next_to(p1, "(DEST/ALTN):", ai_data.get("max_ldg", ""))
-    
     if ai_data.get("landing_weight"):
         draw_text_above(p1, "UPDATE:", f"WB: Landing Weight {ai_data.get('landing_weight')}")
 
+    # 2. Gestion pointue du OBST / ST LIMIT (Barrer celui qui ne sert pas)
+    limit_titles = p1.search_for("OBST/ST LIMIT")
+    if limit_titles:
+        r_lim = limit_titles[0]
+        # On écrit la masse limite
+        p1.insert_text((r_lim.x1 + 5, r_lim.y1), str(ai_data.get("limiting_weight", "")), fontsize=10, fontname="hebo")
+        
+        # On cherche OBST et ST spécifiquement dans cette zone
+        limiting_type = str(ai_data.get("obst_or_st_limiting", "")).upper()
+        obst_r = p1.search_for("OBST", clip=r_lim)
+        st_r = p1.search_for("ST", clip=r_lim)
+        
+        # On tire un trait rouge sur celui qui n'est PAS la limite
+        if limiting_type == "ST" and obst_r:
+            ox = obst_r[0]
+            p1.draw_line((ox.x0, ox.y0 + (ox.y1-ox.y0)/2), (ox.x1, ox.y0 + (ox.y1-ox.y0)/2), color=red_color, width=1.5)
+        elif limiting_type == "OBST" and st_r:
+            sx = st_r[0]
+            p1.draw_line((sx.x0, sx.y0 + (sx.y1-sx.y0)/2), (sx.x1, sx.y0 + (sx.y1-sx.y0)/2), color=red_color, width=1.5)
+
+    # 3. DEST/ALTN Max Landing
+    dest_altn_rects = p1.search_for("DEST/ALTN")
+    if dest_altn_rects:
+        r_dest = dest_altn_rects[0]
+        p1.insert_text((r_dest.x1 + 5, r_dest.y1), str(ai_data.get("max_ldg", "")), fontsize=10, fontname="hebo")
+
+    # 4. Escape Route
     if ai_data.get("escape_route"):
         rects = p1.search_for("1E0 ESCAPE PROCEDURE:")
         if rects:
@@ -156,34 +169,32 @@ def draw_on_pdf(template_bytes, ai_data, user_params):
             text_rect = fitz.Rect(r.x0, r.y1 + 5, r.x0 + 350, r.y1 + 80)
             p1.insert_textbox(text_rect, ai_data["escape_route"], fontsize=8, fontname="helv", align=0)
 
-    # Encadrement du type d'opération (sans radius)
-    ops_rects = p1.search_for(user_params["ops"])
-    for r in ops_rects:
-        if r.y0 < 300:
+    # 5. Type d'Ops (Sécurisé pour ne cibler que l'en-tête)
+    ops_titles = p1.search_for("TYPE OF OPS")
+    if ops_titles:
+        r_title = ops_titles[0]
+        # Zone de recherche restreinte juste à droite du titre
+        search_rect = fitz.Rect(r_title.x1, r_title.y0 - 5, r_title.x1 + 150, r_title.y1 + 5)
+        ops_rects = p1.search_for(user_params["ops"], clip=search_rect)
+        if ops_rects:
+            r = ops_rects[0]
             p1.draw_rect(fitz.Rect(r.x0 - 2, r.y0 - 2, r.x1 + 2, r.y1 + 2), color=red_color, width=1.5)
 
-    # Encadrement du PF et PM (sans radius)
-    pf_pm_rects = p1.search_for("PF-PM")
-    pf_pm_rects = sorted([r for r in pf_pm_rects if 600 < r.y0 < 750], key=lambda x: x.x0)
+    # 6. Encadrement précis du PF / PM
+    # On cherche "PF" et "PM" uniquement dans la moitié basse de la page (Crew)
+    pf_rects = sorted([r for r in p1.search_for("PF") if r.y0 > 400], key=lambda x: x.x0)
+    pm_rects = sorted([r for r in p1.search_for("PM") if r.y0 > 400], key=lambda x: x.x0)
     
-    if len(pf_pm_rects) >= 2:
-        cpt_rect = pf_pm_rects[0]
-        fo_rect = pf_pm_rects[1]
-
-        def draw_box(r, role):
-            w = r.x1 - r.x0
-            if role == "PF": 
-                box = fitz.Rect(r.x0 - 2, r.y0 - 2, r.x0 + w/2, r.y1 + 2)
-            else: 
-                box = fitz.Rect(r.x0 + w/2, r.y0 - 2, r.x1 + 2, r.y1 + 2)
-            p1.draw_rect(box, color=red_color, width=1.5)
-
+    # On suppose que CPT est à gauche (index 0) et F/O à droite (index 1)
+    if len(pf_rects) >= 2 and len(pm_rects) >= 2:
         if user_params["pf"] == "CPT":
-            draw_box(cpt_rect, "PF")
-            draw_box(fo_rect, "PM")
+            # Encadre PF pour CPT et PM pour FO
+            p1.draw_rect(fitz.Rect(pf_rects[0].x0 - 2, pf_rects[0].y0 - 2, pf_rects[0].x1 + 2, pf_rects[0].y1 + 2), color=red_color, width=1.5)
+            p1.draw_rect(fitz.Rect(pm_rects[1].x0 - 2, pm_rects[1].y0 - 2, pm_rects[1].x1 + 2, pm_rects[1].y1 + 2), color=red_color, width=1.5)
         else:
-            draw_box(cpt_rect, "PM")
-            draw_box(fo_rect, "PF")
+            # Encadre PM pour CPT et PF pour FO
+            p1.draw_rect(fitz.Rect(pm_rects[0].x0 - 2, pm_rects[0].y0 - 2, pm_rects[0].x1 + 2, pm_rects[0].y1 + 2), color=red_color, width=1.5)
+            p1.draw_rect(fitz.Rect(pf_rects[1].x0 - 2, pf_rects[1].y0 - 2, pf_rects[1].x1 + 2, pf_rects[1].y1 + 2), color=red_color, width=1.5)
 
     # --- PAGE 2 : ROUTE & MORA ---
     if len(doc) > 1:
@@ -244,7 +255,7 @@ if st.button("🚀 Analyser avec l'IA & Compléter l'OFP", type="primary", use_c
     if not (fp_file and wb_file and template_file):
         st.warning("⚠️ Veuillez charger les 3 documents PDF avant de lancer l'analyse.")
     else:
-        with st.spinner("Analyse et tracé en cours..."):
+        with st.spinner("Analyse approfondie (Météo/APG/WB) et tracé en cours..."):
             doc_wb = fitz.open(stream=wb_file.read(), filetype="pdf")
             wb_text = " ".join([page.get_text() for page in doc_wb])
             wb_text = " ".join(wb_text.split())
@@ -255,8 +266,10 @@ if st.button("🚀 Analyser avec l'IA & Compléter l'OFP", type="primary", use_c
             ai_data = extract_data_with_ai(fp_text, wb_text, api_key)
 
             if ai_data:
-                st.success("✅ Analyse terminée avec succès.")
-                with st.expander("🔍 Vérifier les données brutes extraites"):
+                st.success("✅ Logique de Dispatch terminée avec succès.")
+                
+                # Le bloc expander vous permet de lire le raisonnement de l'IA (pratique pour vérifier ses déductions météo)
+                with st.expander("🔍 Voir le raisonnement de l'IA et les données brutes"):
                     st.json(ai_data)
                 
                 user_params = {"pf": pf, "ops": ops, "driftdown_fl": driftdown_fl}
