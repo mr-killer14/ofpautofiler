@@ -1,165 +1,141 @@
 import streamlit as st
 import pdfplumber
 import fitz  # PyMuPDF
-import re
-import io
-import textwrap
+import json
+import google.generativeai as genai
 
-st.set_page_config(page_title="C525 Smart OFP", layout="wide")
+st.set_page_config(page_title="C525 AI OFP Assistant", layout="wide")
 
-# --- FONCTIONS D'EXTRACTION ---
+# ==========================================
+# 1. FONCTIONS D'INTELLIGENCE ARTIFICIELLE
+# ==========================================
 
-def get_best_runway(wind_dir_str, runways_str):
-    if not wind_dir_str or wind_dir_str == "VRB" or not runways_str: 
-        return runways_str.split()[0] if runways_str else ""
-    wind_dir = int(wind_dir_str)
-    runways = re.findall(r'\d{2}[A-Z]?', runways_str)
-    best_rwy, min_diff = "", 180
-    for rwy in runways:
-        rwy_hdg = int(rwy[:2]) * 10
-        diff = abs(wind_dir - rwy_hdg)
-        if diff > 180: diff = 360 - diff
-        if diff < min_diff:
-            min_diff, best_rwy = diff, rwy
-    return best_rwy
-
-def analyze_weather(text, airport):
-    """Extrait OAT, vent et déduit WET/DRY depuis le METAR."""
-    oat, wind_dir, condition, runways = None, None, "DRY", ""
-    rwy_match = re.search(rf'{airport}.*?RWY\s+([\w\s]+)', text)
-    if rwy_match: runways = rwy_match.group(1).strip()
+def extract_data_with_ai(fp_text, wb_text, api_key):
+    """Envoie le texte brut à l'IA Gemini pour une extraction intelligente."""
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel("gemini-1.5-flash")
     
-    metar_match = re.search(rf'METAR\s+.*?{airport}.*?(\d{{3}}|VRB)(\d{{2,3}})G?\d*KT.*?\s+(M?\d{{2}})/(M?\d{{2}})', text, re.DOTALL)
-    if metar_match:
-        wind_dir = metar_match.group(1)
-        oat = metar_match.group(3).replace('M', '-')
-        condition = "WET" if re.search(r'(RA|DZ|SN|SHRA|FG|BR|HZ)', metar_match.group(0)) else "DRY"
-    return oat, get_best_runway(wind_dir, runways), condition
-
-def extract_apg_wb_data(fp_text, wb_text, flight_data):
-    """Extrait intelligemment l'APG et le W&B."""
-    # Weight & Balance
-    tow = re.search(r'TOW\s+(?:Max\s*\d+\s+)?(?:OK\s+)?(\d{4,5})', wb_text)
-    zfw = re.search(r'ZFW\s+(?:Max\s*\d+\s+)?(?:OK\s+)?(\d{4,5})', wb_text)
-    lw = re.search(r'LW\s+(?:Max\s*\d+\s+)?(?:OK\s+)?(\d{4,5})', wb_text)
-    if tow: flight_data['tow'] = tow.group(1)
-    if zfw: flight_data['zfw'] = zfw.group(1)
-    if lw: flight_data['landing_weight'] = lw.group(1)
-
-    # Aéroports pour l'APG
-    route = re.search(r'DEP\s+([A-Z]{4}).*?DEST\s+([A-Z]{4}).*?ALTN\s+([A-Z]{4})', fp_text)
-    if route:
-        dep, dest, alt = route.group(1), route.group(2), route.group(3)
-    else:
-        return
-
-    # Météo et APG
-    dep_oat, dep_rwy, dep_cond = analyze_weather(fp_text, dep)
-    _, dest_rwy, dest_cond = analyze_weather(fp_text, dest)
-    _, alt_rwy, alt_cond = analyze_weather(fp_text, alt)
-
-    # Takeoff Perfos (Recherche dynamique selon Piste et Condition)
-    to_match = re.search(rf'TAKEOFF PERFORMANCE.*?{dep}.*?Runway\s+{dep_rwy}.*?(\d{{2}}\.\d)\s+(\d{{4,5}})\s+[A-Z]+\s+[\d/]+\s+(\d{{3,4}})', fp_text, re.DOTALL | re.IGNORECASE)
-    if not to_match: # Fallback global si piste non trouvée
-        to_match = re.search(rf'TAKEOFF PERFORMANCE.*?{dep}.*?(\d{{2}}\.\d)\s+(\d{{4,5}})\s+[A-Z]+\s+[\d/]+\s+(\d{{3,4}})', fp_text, re.DOTALL)
+    prompt = f"""
+    Tu es un dispatcher aéronautique expert. Analyse ces documents de vol brut (Flight Package contenant Météo et Perfos APG, et une Loadsheet).
+    Extrais les informations exactes demandées en format JSON pur.
     
-    if to_match:
-        flight_data['to_power'] = to_match.group(1) + "%"
-        flight_data['obst_limit'] = to_match.group(2)
-        flight_data['lvl_off'] = to_match.group(3)
-        flight_data['runway'] = dep_rwy
-
-    # Escape Route
-    escape_match = re.search(r'SPECIAL DEPARTURE PROCEDURES.*?NOTE: NON-RNAV PROCEDURE.*?(?=###)', fp_text, re.DOTALL)
-    if escape_match:
-        cl = escape_match.group(0).replace('b ', '').replace('\n', ' ')
-        flight_data['escape_route'] = re.sub(r'\s+', ' ', cl).strip()
-
-    # Landing Perfos
-    max_dest, max_alt = "9900", "9900"
-    dest_match = re.search(rf'LANDING PERFORMANCE.*?{dest}.*?COND:\s*{dest_cond}.*?2\.5%\s+(\d{{4}})', fp_text, re.DOTALL | re.IGNORECASE)
-    if dest_match: max_dest = dest_match.group(1)
+    Règles strictes:
+    - tow : masse au décollage RÉELLE (pas la structurelle Max 10700).
+    - zfw : zero fuel weight RÉEL (pas la structurelle Max 8500).
+    - landing_weight : landing weight RÉEL (pas la structurelle Max 9900).
+    - to_power : la puissance de décollage (ex: 98.6%) correspondant à la température OAT du METAR de départ et à la bonne piste.
+    - obst_limit : la masse limite d'obstacle APG pour le décollage.
+    - lvl_off : l'altitude de Level Off APG en cas de panne moteur.
+    - runway : la piste de décollage utilisée dans l'APG.
+    - escape_route : le texte de la SPECIAL DEPARTURE PROCEDURE (NOTE: NON-RNAV PROCEDURE...).
+    - max_ldg : sous la forme "DEST/ALTN" (ex: "9900/9900"), en utilisant les perfos APG "LANDING PERFORMANCE" adaptées aux METAR (Dry ou Wet selon la pluie).
     
-    alt_match = re.search(rf'LANDING PERFORMANCE.*?{alt}.*?COND:\s*{alt_cond}.*?2\.5%\s+(\d{{4}})', fp_text, re.DOTALL | re.IGNORECASE)
-    if alt_match: max_alt = alt_match.group(1)
-        
-    flight_data['max_ldg'] = f"{max_dest}/{max_alt}"
+    TEXTE FLIGHT PACKAGE & APG :
+    {fp_text[:8000]} # Limité pour éviter de surcharger le prompt
+    
+    TEXTE WEIGHT & BALANCE :
+    {wb_text[:2000]}
+    
+    Réponds UNIQUEMENT avec ce format JSON (aucune autre phrase) :
+    {{
+        "tow": "", "zfw": "", "landing_weight": "", "to_power": "",
+        "obst_limit": "", "lvl_off": "", "runway": "", "escape_route": "", "max_ldg": ""
+    }}
+    """
+    
+    try:
+        response = model.generate_content(prompt)
+        # Nettoyage de la réponse pour extraire le JSON
+        json_str = response.text.replace("```json", "").replace("```", "").strip()
+        return json.loads(json_str)
+    except Exception as e:
+        st.error(f"Erreur de l'IA : {str(e)}")
+        return None
 
-# --- FONCTION DE DESSIN INTELLIGENT (CTRL+F) ---
+# ==========================================
+# 2. FONCTIONS DE DESSIN PAR ANCRAGE (PyMuPDF)
+# ==========================================
 
-def draw_on_pdf(template_bytes, flight_data):
-    """Utilise PyMuPDF pour chercher les mots sur la page et écrire à côté."""
+def draw_text_next_to(page, keyword, text, offset_x=5, offset_y=0, font="hebo", size=10, color=(0,0,0)):
+    """Cherche un mot-clé et écrit du texte juste à côté."""
+    if not text: return
+    rects = page.search_for(keyword)
+    if rects:
+        r = rects[0]
+        page.insert_text((r.x1 + offset_x, r.y1 + offset_y), str(text), fontsize=size, fontname=font, color=color)
+
+def draw_text_above(page, keyword, text, offset_x=0, offset_y=-15, font="hebo", size=10, color=(0,0,0)):
+    """Cherche un mot-clé et écrit du texte juste au-dessus."""
+    if not text: return
+    rects = page.search_for(keyword)
+    if rects:
+        r = rects[0]
+        page.insert_text((r.x0 + offset_x, r.y0 + offset_y), str(text), fontsize=size, fontname=font, color=color)
+
+def draw_on_pdf(template_bytes, ai_data, user_params):
+    """Utilise PyMuPDF pour scanner visuellement la page et se positionner."""
     doc = fitz.open(stream=template_bytes, filetype="pdf")
-    red_color = (1, 0, 0) # Rouge pour le dessin
+    red_color = (1, 0, 0)
     black_color = (0, 0, 0)
 
-    # PAGE 1 : Remplissage des champs
+    # --- PAGE 1 ---
     p1 = doc[0]
     
-    # Dictionnaire de ce qu'on cherche : ce qu'on écrit
-    to_write = {
-        "T/O POWER:": flight_data.get("to_power", ""),
-        "RUNWAY:": flight_data.get("runway", ""),
-        "TO WEIGHT:": flight_data.get("tow", ""),
-        "OBST/ST LIMIT:": flight_data.get("obst_limit", ""),
-        "LVL OFF:": flight_data.get("lvl_off", ""),
-        "RMQ:": f"ZFW: {flight_data.get('zfw', '')}",
-        "UPDATE:": f"WB: Landing Weight {flight_data.get('landing_weight', '')}",
-        "(DEST/ALTN):": flight_data.get("max_ldg", "")
-    }
+    # 1. Écriture des données à des emplacements relatifs
+    draw_text_next_to(p1, "T/O POWER:", ai_data.get("to_power", ""))
+    draw_text_next_to(p1, "RUNWAY:", ai_data.get("runway", ""))
+    draw_text_next_to(p1, "TO WEIGHT:", ai_data.get("tow", ""))
+    draw_text_next_to(p1, "OBST/ST LIMIT:", ai_data.get("obst_limit", ""))
+    draw_text_next_to(p1, "LVL OFF:", ai_data.get("lvl_off", ""))
+    draw_text_next_to(p1, "RMQ:", f"ZFW: {ai_data.get('zfw', '')}")
+    draw_text_next_to(p1, "(DEST/ALTN):", ai_data.get("max_ldg", ""))
+    
+    # Écriture au-dessus de UPDATE
+    draw_text_above(p1, "UPDATE:", f"WB: Landing Weight {ai_data.get('landing_weight', '')}")
 
-    # Écriture par recherche (Ancrage)
-    for search_text, value_to_write in to_write.items():
-        if not value_to_write: continue
-        rects = p1.search_for(search_text)
-        if rects:
-            rect = rects[0] # Prend la première occurrence
-            # On insère le texte juste à droite de la boîte du mot trouvé
-            p1.insert_text((rect.x1 + 5, rect.y1), value_to_write, fontsize=10, fontname="helv", color=black_color)
-
-    # Escape Route (Dessin dans un rectangle spécifique)
-    if flight_data.get("escape_route"):
+    # 2. Escape Route (En dessous du titre)
+    if ai_data.get("escape_route"):
         rects = p1.search_for("1E0 ESCAPE PROCEDURE:")
         if rects:
-            rect = rects[0]
-            # On définit une zone de texte à droite de ce titre
-            text_rect = fitz.Rect(rect.x1 + 10, rect.y0 - 10, rect.x1 + 250, rect.y0 + 60)
-            p1.insert_textbox(text_rect, flight_data["escape_route"], fontsize=8, fontname="helv", align=0)
+            r = rects[0]
+            text_rect = fitz.Rect(r.x0, r.y1 + 5, r.x0 + 350, r.y1 + 80)
+            p1.insert_textbox(text_rect, ai_data["escape_route"], fontsize=8, fontname="helv", align=0)
 
-    # Entourer les sélections (PF/PM et OPS)
-    ops_rects = p1.search_for(flight_data.get("ops", ""))
+    # 3. Entourer le Type d'Ops (COM/PVT/TRG/MED)
+    ops_rects = p1.search_for(user_params["ops"])
     for r in ops_rects:
-        if 700 < r.y0 < 800: 
-            p1.draw_rect(fitz.Rect(r.x0 - 2, r.y0 - 2, r.x1 + 2, r.y1 + 2), color=red_color, width=1.5)
+        if r.y0 < 300: # Sécurité pour ne cibler que l'en-tête
+            p1.draw_rect(fitz.Rect(r.x0 - 2, r.y0 - 2, r.x1 + 2, r.y1 + 2), color=red_color, width=1.5, radius=2)
 
-    cpt_rects = p1.search_for("CPT")
-    fo_rects = p1.search_for("F/O")
+    # 4. Entourer PF et PM
+    pf_pm_rects = p1.search_for("PF-PM")
+    # On trie par position X (gauche = CPT, droite = F/O)
+    pf_pm_rects = sorted([r for r in pf_pm_rects if 600 < r.y0 < 750], key=lambda x: x.x0)
     
-    if cpt_rects and fo_rects:
-        cpt_rect = [r for r in cpt_rects if 650 < r.y0 < 720]
-        fo_rect = [r for r in fo_rects if 650 < r.y0 < 720]
-        
-        if cpt_rect and fo_rect:
-            cpt_r = cpt_rect[0]
-            fo_r = fo_rect[0]
-            pf_y = cpt_r.y1 + 10 
-            
-            if flight_data["pf"] == "CPT":
-                p1.draw_rect(fitz.Rect(cpt_r.x0 - 5, pf_y, cpt_r.x1 + 5, pf_y + 12), color=red_color, width=1.5)
-                p1.draw_rect(fitz.Rect(fo_r.x0 + 20, pf_y, fo_r.x1 + 15, pf_y + 12), color=red_color, width=1.5)
-            else:
-                p1.draw_rect(fitz.Rect(cpt_r.x0 + 20, pf_y, cpt_r.x1 + 20, pf_y + 12), color=red_color, width=1.5)
-                p1.draw_rect(fitz.Rect(fo_r.x0 - 5, pf_y, fo_r.x1 + 5, pf_y + 12), color=red_color, width=1.5)
+    if len(pf_pm_rects) >= 2:
+        cpt_rect = pf_pm_rects[0]
+        fo_rect = pf_pm_rects[1]
 
-    # PAGE 2 : Drift Down et MORA
+        def draw_circle(r, role):
+            w = r.x1 - r.x0
+            if role == "PF": box = fitz.Rect(r.x0 - 2, r.y0 - 2, r.x0 + w/2, r.y1 + 2)
+            else: box = fitz.Rect(r.x0 + w/2, r.y0 - 2, r.x1 + 2, r.y1 + 2)
+            p1.draw_rect(box, color=red_color, width=1.5, radius=3)
+
+        if user_params["pf"] == "CPT":
+            draw_circle(cpt_rect, "PF")
+            draw_circle(fo_rect, "PM")
+        else:
+            draw_circle(cpt_rect, "PM")
+            draw_circle(fo_rect, "PF")
+
+    # --- PAGE 2 : Drift Down et MORA ---
     if len(doc) > 1:
         p2 = doc[1]
-        
-        if flight_data.get("driftdown_fl"):
+        if user_params.get("driftdown_fl"):
             toc_rects = p2.search_for("-TOC-")
             if toc_rects:
-                r = toc_rects[0]
-                p2.insert_text((r.x1 + 20, r.y1), f"DD: FL {flight_data['driftdown_fl']}", fontsize=10, fontname="hebo", color=red_color)
+                draw_text_next_to(p2, "-TOC-", f"DD: FL {user_params['driftdown_fl']}", offset_x=15, color=red_color)
 
         words = p2.get_text("words")
         max_mora, max_mora_rect = 0, None
@@ -174,19 +150,25 @@ def draw_on_pdf(template_bytes, flight_data):
             recovery_alt = (max_mora * 100) + 1000
             p2.insert_text((max_mora_rect.x1 + 20, max_mora_rect.y1), f"Rec: {recovery_alt} FT", fontsize=10, fontname="hebo", color=red_color)
 
+    # Sauvegarde
     output = io.BytesIO()
     doc.save(output)
     doc.close()
     output.seek(0)
     return output
 
-# --- INTERFACE WEB STREAMLIT ---
+# ==========================================
+# 3. INTERFACE WEB STREAMLIT
+# ==========================================
+
+st.markdown("### 🔑 Configuration")
+api_key = st.text_input("Clé API Google Gemini (Gratuite) :", type="password")
 
 st.markdown("### 🛫 Documents de vol")
 col1, col2, col3 = st.columns(3)
 with col1: fp_file = st.file_uploader("1. Flight Package (PDF)", type="pdf")
 with col2: wb_file = st.file_uploader("2. Weight & Balance (PDF)", type="pdf")
-with col3: template_file = st.file_uploader("3. OFP vierge (PDF)", type="pdf")
+with col3: template_file = st.file_uploader("3. OFP Vierge (PDF)", type="pdf")
 
 st.markdown("### ⚙️ Paramètres du vol")
 col_pf, col_ops, col_dd = st.columns(3)
@@ -194,34 +176,38 @@ with col_pf: pf = st.radio("Pilot Flying (PF) :", ["CPT", "FO"], horizontal=True
 with col_ops: ops = st.radio("Type of Ops :", ["COM", "PVT", "TRG", "MED"], horizontal=True)
 with col_dd: driftdown_fl = st.text_input("Drift Down FL :", placeholder="ex: 220")
 
-if st.button("🚀 Compléter l'OFP", type="primary", use_container_width=True):
-    if not (fp_file and wb_file and template_file):
-        st.warning("⚠️ Veuillez charger les 3 PDF.")
+if st.button("🚀 Analyser avec l'IA & Générer l'OFP", type="primary", use_container_width=True):
+    if not api_key:
+        st.error("⚠️ Veuillez entrer votre clé API Gemini.")
+    elif not (fp_file and wb_file and template_file):
+        st.warning("⚠️ Veuillez charger les 3 documents PDF.")
     else:
-        with st.spinner("Analyse visuelle avec PyMuPDF en cours..."):
-            flight_data = {"pf": pf, "ops": ops, "driftdown_fl": driftdown_fl}
+        with st.spinner("L'IA analyse vos documents (Météo, W&B, APG)..."):
             
-            # W&B
+            # Lecture brute des textes
             with pdfplumber.open(wb_file) as pdf:
-                wb_text = re.sub(r'\s+', ' ', re.sub(r'\|', ' ', pdf.pages[0].extract_text()))
-
-            # Flight Package
+                wb_text = " ".join([p.extract_text() for p in pdf.pages if p.extract_text()])
             with pdfplumber.open(fp_file) as pdf:
                 fp_text = " ".join([p.extract_text() for p in pdf.pages if p.extract_text()])
-                fp_text = re.sub(r'\s+', ' ', re.sub(r'\|', ' ', fp_text))
 
-            # Extraction
-            extract_apg_wb_data(fp_text, wb_text, flight_data)
+            # Appel à l'IA
+            ai_data = extract_data_with_ai(fp_text, wb_text, api_key)
 
-            # Dessin et Sauvegarde
-            template_bytes = template_file.read()
-            final_pdf = draw_on_pdf(template_bytes, flight_data)
+            if ai_data:
+                st.success("✅ Données extraites avec succès par l'IA !")
+                with st.expander("Voir les données extraites"):
+                    st.json(ai_data)
+                
+                # Dessin intelligent
+                user_params = {"pf": pf, "ops": ops, "driftdown_fl": driftdown_fl}
+                template_bytes = template_file.read()
+                
+                final_pdf = draw_on_pdf(template_bytes, ai_data, user_params)
 
-            st.success("✅ L'OFP a été complété intelligemment !")
-            st.download_button(
-                label="📥 Télécharger l'OFP complété",
-                data=final_pdf,
-                file_name="OFP_Complete.pdf",
-                mime="application/pdf",
-                use_container_width=True
-            )
+                st.download_button(
+                    label="📥 Télécharger l'OFP Complété",
+                    data=final_pdf,
+                    file_name="OFP_Smart_Complete.pdf",
+                    mime="application/pdf",
+                    use_container_width=True
+                )
