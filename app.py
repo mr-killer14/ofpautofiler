@@ -159,7 +159,7 @@ def draw_on_pdf(template_bytes, flight_data):
             toc_rects = p2.search_for("-TOC-")
             if toc_rects:
                 r = toc_rects[0]
-                p2.insert_text((r.x1 + 20, r.y1), f"DD: FL {flight_data['driftdown_fl']}", fontsize=10, fontname="helv-bo", color=red_color)
+                p2.insert_text((r.x1 + 20, r.y1), f"DD: FL {flight_data['driftdown_fl']}", fontsize=10, fontname="hebo", color=red_color)
 
         words = p2.get_text("words")
         max_mora, max_mora_rect = 0, None
@@ -172,7 +172,7 @@ def draw_on_pdf(template_bytes, flight_data):
                     
         if max_mora_rect:
             recovery_alt = (max_mora * 100) + 1000
-            p2.insert_text((max_mora_rect.x1 + 20, max_mora_rect.y1), f"Rec: {recovery_alt} FT", fontsize=10, fontname="helv-bo", color=red_color)
+            p2.insert_text((max_mora_rect.x1 + 20, max_mora_rect.y1), f"Rec: {recovery_alt} FT", fontsize=10, fontname="hebo", color=red_color)
 
     output = io.BytesIO()
     doc.save(output)
@@ -186,7 +186,7 @@ st.markdown("### 🛫 Documents de vol")
 col1, col2, col3 = st.columns(3)
 with col1: fp_file = st.file_uploader("1. Flight Package (PDF)", type="pdf")
 with col2: wb_file = st.file_uploader("2. Weight & Balance (PDF)", type="pdf")
-with col3: template_file = st.file_uploader("3. OFP PPS (PDF)", type="pdf")
+with col3: template_file = st.file_uploader("3. OFP vierge (PDF)", type="pdf")
 
 st.markdown("### ⚙️ Paramètres du vol")
 col_pf, col_ops, col_dd = st.columns(3)
@@ -213,7 +213,7 @@ if st.button("🚀 Compléter l'OFP", type="primary", use_container_width=True):
             # Extraction
             extract_apg_wb_data(fp_text, wb_text, flight_data)
 
-            # Dessin
+            # Dessin et Sauvegarde
             template_bytes = template_file.read()
             final_pdf = draw_on_pdf(template_bytes, flight_data)
 
