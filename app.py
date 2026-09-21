@@ -14,7 +14,7 @@ st.set_page_config(page_title="C525 AI OFP Assistant", layout="wide")
 def extract_data_with_ai(fp_text, wb_text, api_key):
     """Envoie le texte brut à l'IA Gemini pour une extraction intelligente."""
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel("gemini-1.5-flash-latest")
+    model = genai.GenerativeModel("gemini-1.5-pro-latest")
     
     prompt = f"""
     Tu es un dispatcher aéronautique expert. Analyse ces documents de vol brut (Flight Package contenant Météo et Perfos APG, et une Loadsheet).
