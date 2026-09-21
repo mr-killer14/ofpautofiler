@@ -1,81 +1,68 @@
 import streamlit as st
-import pdfplumber
 import fitz  # PyMuPDF
 import json
 import io
-import textwrap
+import time
 import google.generativeai as genai
 
 st.set_page_config(page_title="C525 Smart OFP", layout="wide")
 
 # ==========================================
-# 1. FONCTIONS D'INTELLIGENCE ARTIFICIELLE
+# 1. INTELLIGENCE ARTIFICIELLE (EXTRACTION)
 # ==========================================
 
 def extract_data_with_ai(fp_text, wb_text, api_key):
-    """Envoie le texte brut à l'IA Gemini en ciblant la dernière version."""
+    """Envoie le texte brut à l'IA Gemini avec gestion des quotas."""
     genai.configure(api_key=api_key)
+    model = genai.GenerativeModel("gemini-3.6-flash")
     
-    try:
-        # Forçage du modèle explicitement demandé par l'API
-        model = genai.GenerativeModel("gemini-3.6-flash")
-        
-        prompt = f"""
-        Tu es un dispatcher aéronautique expert. Analyse ces documents de vol brut (Flight Package contenant Météo et Perfos APG, et une Loadsheet).
-        Extrais les informations exactes demandées en format JSON pur.
-        
-        Règles strictes:
-        - tow : masse au décollage RÉELLE (pas la structurelle Max 10700).
-        - zfw : zero fuel weight RÉEL (pas la structurelle Max 8500).
-        - landing_weight : landing weight RÉEL (pas la structurelle Max 9900).
-        - to_power : la puissance de décollage (ex: 98.6%) correspondant à la température OAT du METAR de départ et à la bonne piste.
-        - obst_limit : la masse limite d'obstacle APG pour le décollage.
-        - lvl_off : l'altitude de Level Off APG en cas de panne moteur.
-        - runway : la piste de décollage utilisée dans l'APG.
-        - escape_route : le texte de la SPECIAL DEPARTURE PROCEDURE (NOTE: NON-RNAV PROCEDURE...).
-        - max_ldg : sous la forme "DEST/ALTN" (ex: "9900/9900"), en utilisant les perfos APG "LANDING PERFORMANCE" adaptées aux METAR (Dry ou Wet selon la pluie).
-        
-        TEXTE FLIGHT PACKAGE & APG :
-        {fp_text[:8000]}
-        
-        TEXTE WEIGHT & BALANCE :
-        {wb_text[:2000]}
-        
-        Réponds UNIQUEMENT avec ce format JSON (aucune autre phrase) :
-        {{
-            "tow": "", "zfw": "", "landing_weight": "", "to_power": "",
-            "obst_limit": "", "lvl_off": "", "runway": "", "escape_route": "", "max_ldg": ""
-        }}
-        """
-        
-        response = model.generate_content(prompt)
-        json_str = response.text.replace("```json", "").replace("```", "").strip()
-        return json.loads(json_str)
-        
-    except Exception as e:
-        st.error(f"Erreur de l'IA : {str(e)}")
-        return None
-# Appel à l'IA avec gestion automatique du quota
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                response = model.generate_content(prompt)
-                json_str = response.text.replace("```json", "").replace("```", "").strip()
-                return json.loads(json_str)
-            except Exception as e:
-                erreur = str(e)
-                # Si on détecte une erreur de quota (429), on met le code en pause
-                if "429" in erreur or "quota" in erreur.lower():
-                    if attempt < max_retries - 1:
-                        st.warning(f"⏳ Quota IA temporairement atteint. Pause automatique de 36 secondes avant la relance...")
-                        time.sleep(36)
-                        continue
-                
-                # Si c'est une autre erreur, on l'affiche et on arrête
-                st.error(f"Erreur de l'IA : {erreur}")
-                return None
+    prompt = f"""
+    Tu es un dispatcher aéronautique expert. Analyse ces documents de vol brut (Flight Package contenant Météo et Perfos APG, et une Loadsheet).
+    Extrais les informations exactes demandées en format JSON pur.
+    
+    Règles strictes:
+    - tow : masse au décollage RÉELLE (pas la structurelle Max 10700).
+    - zfw : zero fuel weight RÉEL (pas la structurelle Max 8500).
+    - landing_weight : landing weight RÉEL (pas la structurelle Max 9900).
+    - to_power : la puissance de décollage (ex: 98.6%) correspondant à la température OAT du METAR de départ et à la bonne piste.
+    - obst_limit : la masse limite d'obstacle APG pour le décollage.
+    - lvl_off : l'altitude de Level Off APG en cas de panne moteur.
+    - runway : la piste de décollage utilisée dans l'APG.
+    - escape_route : le texte de la SPECIAL DEPARTURE PROCEDURE (NOTE: NON-RNAV PROCEDURE...).
+    - max_ldg : sous la forme "DEST/ALTN" (ex: "9900/9900"), en utilisant les perfos APG "LANDING PERFORMANCE" adaptées aux METAR (Dry ou Wet selon la pluie).
+    
+    TEXTE FLIGHT PACKAGE & APG :
+    {fp_text[:8000]}
+    
+    TEXTE WEIGHT & BALANCE :
+    {wb_text[:2000]}
+    
+    Réponds UNIQUEMENT avec ce format JSON (aucune autre phrase) :
+    {{
+        "tow": "", "zfw": "", "landing_weight": "", "to_power": "",
+        "obst_limit": "", "lvl_off": "", "runway": "", "escape_route": "", "max_ldg": ""
+    }}
+    """
+    
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            response = model.generate_content(prompt)
+            json_str = response.text.replace("```json", "").replace("```", "").strip()
+            return json.loads(json_str)
+        except Exception as e:
+            erreur = str(e)
+            if "429" in erreur or "quota" in erreur.lower():
+                if attempt < max_retries - 1:
+                    st.warning(f"⏳ Quota IA atteint (version gratuite). Pause automatique de 36s avant relance...")
+                    time.sleep(36)
+                    continue
+            st.error(f"Erreur de l'IA : {erreur}")
+            return None
+    return None
+
 # ==========================================
-# 2. FONCTIONS DE DESSIN PAR ANCRAGE (PyMuPDF)
+# 2. DESSIN PAR ANCRAGE SPATIAL (PyMuPDF)
 # ==========================================
 
 def draw_text_next_to(page, keyword, text, offset_x=5, offset_y=0, font="hebo", size=10, color=(0,0,0)):
@@ -95,12 +82,11 @@ def draw_text_above(page, keyword, text, offset_x=0, offset_y=-15, font="hebo", 
 def draw_on_pdf(template_bytes, ai_data, user_params):
     doc = fitz.open(stream=template_bytes, filetype="pdf")
     red_color = (1, 0, 0)
-    black_color = (0, 0, 0)
-
+    
     # --- PAGE 1 ---
     p1 = doc[0]
     
-    # 1. Écriture des données par ancrage spatial
+    # Textes
     draw_text_next_to(p1, "T/O POWER:", ai_data.get("to_power", ""))
     draw_text_next_to(p1, "RUNWAY:", ai_data.get("runway", ""))
     draw_text_next_to(p1, "TO WEIGHT:", ai_data.get("tow", ""))
@@ -108,11 +94,9 @@ def draw_on_pdf(template_bytes, ai_data, user_params):
     draw_text_next_to(p1, "LVL OFF:", ai_data.get("lvl_off", ""))
     draw_text_next_to(p1, "RMQ:", f"ZFW: {ai_data.get('zfw', '')}")
     draw_text_next_to(p1, "(DEST/ALTN):", ai_data.get("max_ldg", ""))
-    
-    # Écriture au-dessus de UPDATE
     draw_text_above(p1, "UPDATE:", f"WB: Landing Weight {ai_data.get('landing_weight', '')}")
 
-    # 2. Escape Route (En dessous du titre)
+    # Escape Route
     if ai_data.get("escape_route"):
         rects = p1.search_for("1E0 ESCAPE PROCEDURE:")
         if rects:
@@ -120,15 +104,14 @@ def draw_on_pdf(template_bytes, ai_data, user_params):
             text_rect = fitz.Rect(r.x0, r.y1 + 5, r.x0 + 350, r.y1 + 80)
             p1.insert_textbox(text_rect, ai_data["escape_route"], fontsize=8, fontname="helv", align=0)
 
-    # 3. Entourer le Type d'Ops (COM/PVT/TRG/MED)
+    # Entourer Type d'Ops
     ops_rects = p1.search_for(user_params["ops"])
     for r in ops_rects:
-        if r.y0 < 300: # Sécurité pour ne cibler que l'en-tête
+        if r.y0 < 300: 
             p1.draw_rect(fitz.Rect(r.x0 - 2, r.y0 - 2, r.x1 + 2, r.y1 + 2), color=red_color, width=1.5, radius=2)
 
-    # 4. Entourer PF et PM
+    # Entourer PF et PM
     pf_pm_rects = p1.search_for("PF-PM")
-    # Tri par position X (gauche = CPT, droite = F/O)
     pf_pm_rects = sorted([r for r in pf_pm_rects if 600 < r.y0 < 750], key=lambda x: x.x0)
     
     if len(pf_pm_rects) >= 2:
@@ -148,15 +131,13 @@ def draw_on_pdf(template_bytes, ai_data, user_params):
             draw_circle(cpt_rect, "PM")
             draw_circle(fo_rect, "PF")
 
-    # --- PAGE 2 : Drift Down et MORA ---
+    # --- PAGE 2 ---
     if len(doc) > 1:
         p2 = doc[1]
         
         # Drift Down
         if user_params.get("driftdown_fl"):
-            toc_rects = p2.search_for("-TOC-")
-            if toc_rects:
-                draw_text_next_to(p2, "-TOC-", f"DD: FL {user_params['driftdown_fl']}", offset_x=15, color=red_color)
+            draw_text_next_to(p2, "-TOC-", f"DD: FL {user_params['driftdown_fl']}", offset_x=15, color=red_color)
 
         # MORA Max
         words = p2.get_text("words")
@@ -205,31 +186,23 @@ if st.button("🚀 Analyser avec l'IA & Générer l'OFP", type="primary", use_co
     if not (fp_file and wb_file and template_file):
         st.warning("⚠️ Veuillez charger les 3 documents PDF.")
     else:
-       with st.spinner("L'IA analyse vos documents (Météo, W&B, APG)..."):
+        with st.spinner("L'IA analyse vos documents (Météo, W&B, APG)..."):
             
-            # 1. Lecture ultra-rapide du W&B avec PyMuPDF
+            # 1. Lecture ultra-rapide du W&B
             doc_wb = fitz.open(stream=wb_file.read(), filetype="pdf")
             wb_text = " ".join([page.get_text() for page in doc_wb])
             doc_wb.close()
-            wb_file.seek(0) # Réinitialise le fichier pour ne pas le bloquer
 
             # 2. Lecture ciblée du Flight Package (Saut des NOTAMs)
             doc_fp = fitz.open(stream=fp_file.read(), filetype="pdf")
             total_pages = len(doc_fp)
-            
-            # On sélectionne les 15 premières pages (Météo/OFP) et les 15 dernières (APG)
             pages_to_read = list(range(min(15, total_pages)))
             if total_pages > 30:
                 pages_to_read += list(range(total_pages - 15, total_pages))
-            
             fp_text = " ".join([doc_fp[i].get_text() for i in set(pages_to_read)])
             doc_fp.close()
-            fp_file.seek(0)
 
-            # 3. Appel à l'IA
-            ai_data = extract_data_with_ai(fp_text, wb_text, api_key)
-
-            # Analyse via l'IA
+            # 3. Extraction par l'IA
             ai_data = extract_data_with_ai(fp_text, wb_text, api_key)
 
             if ai_data:
@@ -237,11 +210,9 @@ if st.button("🚀 Analyser avec l'IA & Générer l'OFP", type="primary", use_co
                 with st.expander("Voir les données extraites"):
                     st.json(ai_data)
                 
-                # Paramètres utilisateur
+                # 4. Dessin du PDF final
                 user_params = {"pf": pf, "ops": ops, "driftdown_fl": driftdown_fl}
                 template_bytes = template_file.read()
-                
-                # Génération du PDF
                 final_pdf = draw_on_pdf(template_bytes, ai_data, user_params)
 
                 st.download_button(
