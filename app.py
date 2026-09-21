@@ -1,4 +1,5 @@
 import streamlit as st
+import pdfplumber
 import fitz  # PyMuPDF
 import re
 import io
@@ -84,12 +85,13 @@ def extract_apg_wb_data(fp_text, wb_text, flight_data):
         
     flight_data['max_ldg'] = f"{max_dest}/{max_alt}"
 
-# --- 3. FONCTION DE DESSIN INTELLIGENT (CTRL+F) ---
+# --- FONCTION DE DESSIN INTELLIGENT (CTRL+F) ---
 
 def draw_on_pdf(template_bytes, flight_data):
     """Utilise PyMuPDF pour chercher les mots sur la page et écrire à côté."""
     doc = fitz.open(stream=template_bytes, filetype="pdf")
     red_color = (1, 0, 0) # Rouge pour le dessin
+    black_color = (0, 0, 0)
 
     # PAGE 1 : Remplissage des champs
     p1 = doc[0]
@@ -113,7 +115,7 @@ def draw_on_pdf(template_bytes, flight_data):
         if rects:
             rect = rects[0] # Prend la première occurrence
             # On insère le texte juste à droite de la boîte du mot trouvé
-            p1.insert_text((rect.x1 + 5, rect.y1), value_to_write, fontsize=10, fontname="helv", color=(0,0,0))
+            p1.insert_text((rect.x1 + 5, rect.y1), value_to_write, fontsize=10, fontname="helv", color=black_color)
 
     # Escape Route (Dessin dans un rectangle spécifique)
     if flight_data.get("escape_route"):
@@ -125,42 +127,40 @@ def draw_on_pdf(template_bytes, flight_data):
             p1.insert_textbox(text_rect, flight_data["escape_route"], fontsize=8, fontname="helv", align=0)
 
     # Entourer les sélections (PF/PM et OPS)
-    # Cherche le type d'ops et l'entoure
     ops_rects = p1.search_for(flight_data.get("ops", ""))
     for r in ops_rects:
-        # On vérifie qu'on entoure bien la ligne OPS et pas un autre endroit
         if 700 < r.y0 < 800: 
             p1.draw_rect(fitz.Rect(r.x0 - 2, r.y0 - 2, r.x1 + 2, r.y1 + 2), color=red_color, width=1.5)
 
-    # Entourer PF et PM
     cpt_rects = p1.search_for("CPT")
     fo_rects = p1.search_for("F/O")
     
     if cpt_rects and fo_rects:
-        # On prend les occurences situées dans le tableau des temps
-        cpt_rect = [r for r in cpt_rects if 650 < r.y0 < 720][0]
-        fo_rect = [r for r in fo_rects if 650 < r.y0 < 720][0]
+        cpt_rect = [r for r in cpt_rects if 650 < r.y0 < 720]
+        fo_rect = [r for r in fo_rects if 650 < r.y0 < 720]
         
-        pf_y = cpt_rect.y1 + 10 # La ligne en dessous
-        if flight_data["pf"] == "CPT":
-            p1.draw_rect(fitz.Rect(cpt_rect.x0 - 5, pf_y, cpt_rect.x1 + 5, pf_y + 12), color=red_color, width=1.5)
-            p1.draw_rect(fitz.Rect(fo_rect.x0 + 20, pf_y, fo_rect.x1 + 15, pf_y + 12), color=red_color, width=1.5)
-        else:
-            p1.draw_rect(fitz.Rect(cpt_rect.x0 + 20, pf_y, cpt_rect.x1 + 20, pf_y + 12), color=red_color, width=1.5)
-            p1.draw_rect(fitz.Rect(fo_rect.x0 - 5, pf_y, fo_rect.x1 + 5, pf_y + 12), color=red_color, width=1.5)
+        if cpt_rect and fo_rect:
+            cpt_r = cpt_rect[0]
+            fo_r = fo_rect[0]
+            pf_y = cpt_r.y1 + 10 
+            
+            if flight_data["pf"] == "CPT":
+                p1.draw_rect(fitz.Rect(cpt_r.x0 - 5, pf_y, cpt_r.x1 + 5, pf_y + 12), color=red_color, width=1.5)
+                p1.draw_rect(fitz.Rect(fo_r.x0 + 20, pf_y, fo_r.x1 + 15, pf_y + 12), color=red_color, width=1.5)
+            else:
+                p1.draw_rect(fitz.Rect(cpt_r.x0 + 20, pf_y, cpt_r.x1 + 20, pf_y + 12), color=red_color, width=1.5)
+                p1.draw_rect(fitz.Rect(fo_r.x0 - 5, pf_y, fo_r.x1 + 5, pf_y + 12), color=red_color, width=1.5)
 
     # PAGE 2 : Drift Down et MORA
     if len(doc) > 1:
         p2 = doc[1]
         
-        # Drift Down
         if flight_data.get("driftdown_fl"):
             toc_rects = p2.search_for("-TOC-")
             if toc_rects:
                 r = toc_rects[0]
                 p2.insert_text((r.x1 + 20, r.y1), f"DD: FL {flight_data['driftdown_fl']}", fontsize=10, fontname="helv-bo", color=red_color)
 
-        # MORA
         words = p2.get_text("words")
         max_mora, max_mora_rect = 0, None
         for w in words:
@@ -174,14 +174,13 @@ def draw_on_pdf(template_bytes, flight_data):
             recovery_alt = (max_mora * 100) + 1000
             p2.insert_text((max_mora_rect.x1 + 20, max_mora_rect.y1), f"Rec: {recovery_alt} FT", fontsize=10, fontname="helv-bo", color=red_color)
 
-    # Sauvegarde
     output = io.BytesIO()
     doc.save(output)
     doc.close()
     output.seek(0)
     return output
 
-# --- 4. INTERFACE WEB STREAMLIT ---
+# --- INTERFACE WEB STREAMLIT ---
 
 st.markdown("### 🛫 Documents de vol")
 col1, col2, col3 = st.columns(3)
@@ -211,10 +210,10 @@ if st.button("🚀 Compléter l'OFP", type="primary", use_container_width=True):
                 fp_text = " ".join([p.extract_text() for p in pdf.pages if p.extract_text()])
                 fp_text = re.sub(r'\s+', ' ', re.sub(r'\|', ' ', fp_text))
 
-            # Extraction Intelligente APG et WB
+            # Extraction
             extract_apg_wb_data(fp_text, wb_text, flight_data)
 
-            # Dessin et Sauvegarde avec PyMuPDF
+            # Dessin
             template_bytes = template_file.read()
             final_pdf = draw_on_pdf(template_bytes, flight_data)
 
