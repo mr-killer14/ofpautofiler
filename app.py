@@ -71,10 +71,11 @@ def extract_data_with_ai(fp_text, wb_text, api_key):
     try:
         chat_completion = client.chat.completions.create(
             messages=[{"role": "user", "content": prompt}],
-            model="llama-3.3-70b-versatile",
+            model="llama-3.1-8b-instant",
             temperature=0,
+            response_format={"type": "json_object"},
         )
-        
+
         response_text = chat_completion.choices[0].message.content
         json_str = response_text.replace("```json", "").replace("```", "").strip()
         return json.loads(json_str)
