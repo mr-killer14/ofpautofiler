@@ -2,6 +2,7 @@ import streamlit as st
 import pdfplumber
 import fitz  # PyMuPDF
 import json
+import io
 import google.generativeai as genai
 
 st.set_page_config(page_title="C525 AI OFP Assistant", layout="wide")
@@ -31,7 +32,7 @@ def extract_data_with_ai(fp_text, wb_text, api_key):
     - max_ldg : sous la forme "DEST/ALTN" (ex: "9900/9900"), en utilisant les perfos APG "LANDING PERFORMANCE" adaptées aux METAR (Dry ou Wet selon la pluie).
     
     TEXTE FLIGHT PACKAGE & APG :
-    {fp_text[:8000]} # Limité pour éviter de surcharger le prompt
+    {fp_text[:8000]}
     
     TEXTE WEIGHT & BALANCE :
     {wb_text[:2000]}
@@ -45,7 +46,6 @@ def extract_data_with_ai(fp_text, wb_text, api_key):
     
     try:
         response = model.generate_content(prompt)
-        # Nettoyage de la réponse pour extraire le JSON
         json_str = response.text.replace("```json", "").replace("```", "").strip()
         return json.loads(json_str)
     except Exception as e:
@@ -57,7 +57,6 @@ def extract_data_with_ai(fp_text, wb_text, api_key):
 # ==========================================
 
 def draw_text_next_to(page, keyword, text, offset_x=5, offset_y=0, font="hebo", size=10, color=(0,0,0)):
-    """Cherche un mot-clé et écrit du texte juste à côté."""
     if not text: return
     rects = page.search_for(keyword)
     if rects:
@@ -65,7 +64,6 @@ def draw_text_next_to(page, keyword, text, offset_x=5, offset_y=0, font="hebo", 
         page.insert_text((r.x1 + offset_x, r.y1 + offset_y), str(text), fontsize=size, fontname=font, color=color)
 
 def draw_text_above(page, keyword, text, offset_x=0, offset_y=-15, font="hebo", size=10, color=(0,0,0)):
-    """Cherche un mot-clé et écrit du texte juste au-dessus."""
     if not text: return
     rects = page.search_for(keyword)
     if rects:
@@ -73,7 +71,6 @@ def draw_text_above(page, keyword, text, offset_x=0, offset_y=-15, font="hebo", 
         page.insert_text((r.x0 + offset_x, r.y0 + offset_y), str(text), fontsize=size, fontname=font, color=color)
 
 def draw_on_pdf(template_bytes, ai_data, user_params):
-    """Utilise PyMuPDF pour scanner visuellement la page et se positionner."""
     doc = fitz.open(stream=template_bytes, filetype="pdf")
     red_color = (1, 0, 0)
     black_color = (0, 0, 0)
@@ -81,7 +78,7 @@ def draw_on_pdf(template_bytes, ai_data, user_params):
     # --- PAGE 1 ---
     p1 = doc[0]
     
-    # 1. Écriture des données à des emplacements relatifs
+    # 1. Écriture des données
     draw_text_next_to(p1, "T/O POWER:", ai_data.get("to_power", ""))
     draw_text_next_to(p1, "RUNWAY:", ai_data.get("runway", ""))
     draw_text_next_to(p1, "TO WEIGHT:", ai_data.get("tow", ""))
@@ -89,11 +86,9 @@ def draw_on_pdf(template_bytes, ai_data, user_params):
     draw_text_next_to(p1, "LVL OFF:", ai_data.get("lvl_off", ""))
     draw_text_next_to(p1, "RMQ:", f"ZFW: {ai_data.get('zfw', '')}")
     draw_text_next_to(p1, "(DEST/ALTN):", ai_data.get("max_ldg", ""))
-    
-    # Écriture au-dessus de UPDATE
     draw_text_above(p1, "UPDATE:", f"WB: Landing Weight {ai_data.get('landing_weight', '')}")
 
-    # 2. Escape Route (En dessous du titre)
+    # 2. Escape Route
     if ai_data.get("escape_route"):
         rects = p1.search_for("1E0 ESCAPE PROCEDURE:")
         if rects:
@@ -101,15 +96,14 @@ def draw_on_pdf(template_bytes, ai_data, user_params):
             text_rect = fitz.Rect(r.x0, r.y1 + 5, r.x0 + 350, r.y1 + 80)
             p1.insert_textbox(text_rect, ai_data["escape_route"], fontsize=8, fontname="helv", align=0)
 
-    # 3. Entourer le Type d'Ops (COM/PVT/TRG/MED)
+    # 3. Entourer le Type d'Ops
     ops_rects = p1.search_for(user_params["ops"])
     for r in ops_rects:
-        if r.y0 < 300: # Sécurité pour ne cibler que l'en-tête
+        if r.y0 < 300: 
             p1.draw_rect(fitz.Rect(r.x0 - 2, r.y0 - 2, r.x1 + 2, r.y1 + 2), color=red_color, width=1.5, radius=2)
 
     # 4. Entourer PF et PM
     pf_pm_rects = p1.search_for("PF-PM")
-    # On trie par position X (gauche = CPT, droite = F/O)
     pf_pm_rects = sorted([r for r in pf_pm_rects if 600 < r.y0 < 750], key=lambda x: x.x0)
     
     if len(pf_pm_rects) >= 2:
@@ -150,7 +144,6 @@ def draw_on_pdf(template_bytes, ai_data, user_params):
             recovery_alt = (max_mora * 100) + 1000
             p2.insert_text((max_mora_rect.x1 + 20, max_mora_rect.y1), f"Rec: {recovery_alt} FT", fontsize=10, fontname="hebo", color=red_color)
 
-    # Sauvegarde
     output = io.BytesIO()
     doc.save(output)
     doc.close()
@@ -160,9 +153,6 @@ def draw_on_pdf(template_bytes, ai_data, user_params):
 # ==========================================
 # 3. INTERFACE WEB STREAMLIT
 # ==========================================
-
-st.markdown("### 🔑 Configuration")
-api_key = st.text_input("Clé API Google Gemini (Gratuite) :", type="password")
 
 st.markdown("### 🛫 Documents de vol")
 col1, col2, col3 = st.columns(3)
@@ -177,20 +167,25 @@ with col_ops: ops = st.radio("Type of Ops :", ["COM", "PVT", "TRG", "MED"], hori
 with col_dd: driftdown_fl = st.text_input("Drift Down FL :", placeholder="ex: 220")
 
 if st.button("🚀 Analyser avec l'IA & Générer l'OFP", type="primary", use_container_width=True):
-    if not api_key:
-        st.error("⚠️ Veuillez entrer votre clé API Gemini.")
-    elif not (fp_file and wb_file and template_file):
+    
+    # 1. Vérification de la clé API secrète
+    try:
+        api_key = st.secrets["GEMINI_API_KEY"]
+    except Exception:
+        st.error("⚠️ La clé API n'est pas configurée.")
+        st.info("Allez dans les Paramètres (Settings) de votre application sur Streamlit Cloud, cliquez sur l'onglet 'Secrets', et ajoutez la ligne suivante :\n\n`GEMINI_API_KEY = \"votre_cle_api\"`")
+        st.stop()
+
+    if not (fp_file and wb_file and template_file):
         st.warning("⚠️ Veuillez charger les 3 documents PDF.")
     else:
         with st.spinner("L'IA analyse vos documents (Météo, W&B, APG)..."):
             
-            # Lecture brute des textes
             with pdfplumber.open(wb_file) as pdf:
                 wb_text = " ".join([p.extract_text() for p in pdf.pages if p.extract_text()])
             with pdfplumber.open(fp_file) as pdf:
                 fp_text = " ".join([p.extract_text() for p in pdf.pages if p.extract_text()])
 
-            # Appel à l'IA
             ai_data = extract_data_with_ai(fp_text, wb_text, api_key)
 
             if ai_data:
@@ -198,7 +193,6 @@ if st.button("🚀 Analyser avec l'IA & Générer l'OFP", type="primary", use_co
                 with st.expander("Voir les données extraites"):
                     st.json(ai_data)
                 
-                # Dessin intelligent
                 user_params = {"pf": pf, "ops": ops, "driftdown_fl": driftdown_fl}
                 template_bytes = template_file.read()
                 
