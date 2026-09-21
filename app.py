@@ -2,8 +2,7 @@ import streamlit as st
 import fitz  # PyMuPDF : La bibliothèque la plus performante pour lire et éditer des PDF
 import json
 import io
-import time
-import google.generativeai as genai
+from groq import Groq
 
 # Configuration de base de la page web Streamlit
 st.set_page_config(page_title="C525 Smart OFP Assistant", layout="wide", page_icon="✈️")
@@ -29,40 +28,35 @@ def extract_text_from_fp(fp_file):
     # Création d'une liste des pages à lire (0 à 14)
     pages_to_read = list(range(min(15, total_pages)))
     
-    # Si le document est très long, on ajoute les 15 dernières pages (pour choper l'APG)
+    # Si le document est très long, on ajoute les 15 dernières pages (pour récupérer l'APG)
     if total_pages > 30:
         pages_to_read += list(range(total_pages - 15, total_pages))
         
-    # Extraction du texte en ignorant les doublons si le doc fait moins de 30 pages
+    # Extraction du texte en ignorant les doublons
     fp_text = " ".join([doc_fp[i].get_text() for i in set(pages_to_read)])
     doc_fp.close()
     
-    # Nettoyage des espaces et retours à la ligne superflus pour aider l'IA
+    # Nettoyage des espaces et retours à la ligne superflus pour optimiser le prompt IA
     fp_text = " ".join(fp_text.split())
     return fp_text
 
 # =====================================================================
-# SECTION 2 : ANALYSE INTELLIGENTE (TEXTE -> DONNÉES STRUCTURÉES)
+# SECTION 2 : ANALYSE INTELLIGENTE VIA GROQ (TEXTE -> JSON)
 # =====================================================================
 
 def extract_data_with_ai(fp_text, wb_text, api_key):
     """
-    Objectif : Utiliser l'IA Gemini pour comprendre le contexte du vol et extraire les valeurs.
-    Problème résolu : Remplace les recherches par mots-clés (Regex) qui plantent si le format change.
-    Méthode : Envoie un "Prompt" strict à Gemini 3.6 Flash exigeant une réponse en JSON pur, 
-              avec une gestion avancée des erreurs de quota (limites gratuites).
+    Objectif : Utiliser l'IA (Llama 3.1 via Groq) pour extraire les valeurs clés.
+    Avantage : Traitement ultra-rapide et gratuit, insensible aux quotas de Gemini.
     
     Args:
         fp_text (str): Le texte brut du Flight Package.
         wb_text (str): Le texte brut du Weight & Balance.
-        api_key (str): La clé API Google secrète.
+        api_key (str): La clé API Groq secrète.
     Returns:
-        Dict: Un dictionnaire Python (JSON) contenant toutes les valeurs, ou None si échec.
+        Dict: Un dictionnaire Python contenant toutes les valeurs, ou None si échec.
     """
-    genai.configure(api_key=api_key)
-    
-    # Forçage du modèle spécifique exigé par l'API Google
-    model = genai.GenerativeModel("gemini-3.6-flash")
+    client = Groq(api_key=api_key)
     
     prompt = f"""
     Tu es un dispatcher aéronautique expert. Analyse ces documents de vol brut (Flight Package contenant Météo et Perfos APG, et une Loadsheet).
@@ -80,7 +74,7 @@ def extract_data_with_ai(fp_text, wb_text, api_key):
     - max_ldg : sous la forme "DEST/ALTN" (ex: "9900/9900"), en utilisant les perfos APG "LANDING PERFORMANCE" adaptées aux METAR (Dry ou Wet).
     
     TEXTE FLIGHT PACKAGE & APG :
-    {fp_text[:8000]} # On limite à 8000 caractères pour ne pas surcharger la mémoire de l'IA
+    {fp_text[:8000]} 
     
     TEXTE WEIGHT & BALANCE :
     {wb_text[:2000]}
@@ -92,70 +86,41 @@ def extract_data_with_ai(fp_text, wb_text, api_key):
     }}
     """
     
-    # Boucle de tentative (Retry Logic) pour contourner les erreurs réseau ou de quota court
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            response = model.generate_content(prompt)
-            # Nettoyage de la réponse si l'IA inclut des balises Markdown (```json ... ```)
-            json_str = response.text.replace("```json", "").replace("```", "").strip()
-            return json.loads(json_str)
-            
-        except Exception as e:
-            erreur = str(e)
-            
-            # Gestion des erreurs de Quota (Code 429)
-            if "429" in erreur or "quota" in erreur.lower():
-                # Si le quota journalier de 20 requêtes est épuisé (Free Tier)
-                if "PerDay" in erreur:
-                    st.error("❌ Quota journalier IA épuisé (20 requêtes/jour max). Veuillez utiliser une autre clé API ou réessayer demain.")
-                    return None
-                # Si c'est juste le quota par minute (5 requêtes/min), on patiente
-                else:
-                    if attempt < max_retries - 1:
-                        st.warning(f"⏳ Quota IA atteint (Free Tier). Pause automatique de 60s pour réinitialisation...")
-                        time.sleep(60)
-                        continue
-            
-            # Si c'est une autre erreur (serveur Google HS, JSON mal formé, etc.)
-            st.error(f"Erreur inattendue de l'IA : {erreur}")
-            return None
-            
-    return None
+    try:
+        # Appel à l'API Groq (Modèle Llama 3.1 70B pour une précision maximale)
+        chat_completion = client.chat.completions.create(
+            messages=[{"role": "user", "content": prompt}],
+            model="llama-3.1-70b-versatile",
+            temperature=0, # 0 = 100% factuel, aucune hallucination
+        )
+        
+        # Nettoyage et formatage du JSON retourné
+        response_text = chat_completion.choices[0].message.content
+        json_str = response_text.replace("```json", "").replace("```", "").strip()
+        return json.loads(json_str)
+        
+    except Exception as e:
+        st.error(f"Erreur lors de l'analyse IA (Groq) : {str(e)}")
+        return None
 
 # =====================================================================
 # SECTION 3 : OUTILS DE DESSIN PAR ANCRAGE SPATIAL (GÉOMÉTRIE)
 # =====================================================================
 
 def draw_text_next_to(page, keyword, text, offset_x=5, offset_y=0, font="hebo", size=10, color=(0,0,0)):
-    """
-    Objectif : Trouver un mot-clé sur la page et écrire une donnée juste à sa droite.
-    Exemple : Trouve "T/O POWER:" et écrit "98.6%" à +5 pixels sur la droite.
-    
-    Args:
-        page: L'objet page PyMuPDF en cours d'édition.
-        keyword (str): Le mot exact à chercher (ex: "RUNWAY:").
-        text (str): La valeur à écrire.
-        offset_x (int): Décalage horizontal par rapport au bord droit du mot-clé.
-        offset_y (int): Décalage vertical (0 = aligné sur la même ligne de base).
-    """
-    if not text: return
-    rects = page.search_for(keyword)
-    if rects:
-        r = rects[0] # On prend la première apparition du mot sur la page
-        # r.x1 est le bord droit du mot, r.y1 est la base du mot
-        page.insert_text((r.x1 + offset_x, r.y1 + offset_y), str(text), fontsize=size, fontname=font, color=color)
-
-def draw_text_above(page, keyword, text, offset_x=0, offset_y=-15, font="hebo", size=10, color=(0,0,0)):
-    """
-    Objectif : Trouver un mot-clé sur la page et écrire une donnée juste au-dessus.
-    Exemple : Trouve "UPDATE:" et écrit la Landing Weight juste au-dessus.
-    """
+    """Trouve un mot-clé sur la page et écrit la donnée juste à sa droite."""
     if not text: return
     rects = page.search_for(keyword)
     if rects:
         r = rects[0]
-        # r.x0 est le bord gauche du mot, r.y0 est le sommet du mot
+        page.insert_text((r.x1 + offset_x, r.y1 + offset_y), str(text), fontsize=size, fontname=font, color=color)
+
+def draw_text_above(page, keyword, text, offset_x=0, offset_y=-15, font="hebo", size=10, color=(0,0,0)):
+    """Trouve un mot-clé sur la page et écrit la donnée juste au-dessus."""
+    if not text: return
+    rects = page.search_for(keyword)
+    if rects:
+        r = rects[0]
         page.insert_text((r.x0 + offset_x, r.y0 + offset_y), str(text), fontsize=size, fontname=font, color=color)
 
 # =====================================================================
@@ -164,11 +129,7 @@ def draw_text_above(page, keyword, text, offset_x=0, offset_y=-15, font="hebo", 
 
 def draw_on_pdf(template_bytes, ai_data, user_params):
     """
-    Objectif : Moteur principal de dessin. Prend le PDF vierge, l'analyse avec les outils 
-               de la Section 3, et applique les données de l'IA (Section 2) et les choix du pilote.
-    
-    Returns:
-        io.BytesIO: Le fichier PDF généré en mémoire (prêt à être téléchargé).
+    Objectif : Appliquer les données extraites par l'IA et les choix du pilote sur l'OFP vierge.
     """
     doc = fitz.open(stream=template_bytes, filetype="pdf")
     red_color = (1, 0, 0)
@@ -176,7 +137,7 @@ def draw_on_pdf(template_bytes, ai_data, user_params):
     # ------------------ PAGE 1 : EN-TÊTE ET PERFORMANCES ------------------
     p1 = doc[0]
     
-    # 1. Écriture des données chiffrées
+    # 1. Écriture des données (Ancrage sur les étiquettes existantes)
     draw_text_next_to(p1, "T/O POWER:", ai_data.get("to_power", ""))
     draw_text_next_to(p1, "RUNWAY:", ai_data.get("runway", ""))
     draw_text_next_to(p1, "TO WEIGHT:", ai_data.get("tow", ""))
@@ -184,49 +145,38 @@ def draw_on_pdf(template_bytes, ai_data, user_params):
     draw_text_next_to(p1, "LVL OFF:", ai_data.get("lvl_off", ""))
     draw_text_next_to(p1, "RMQ:", f"ZFW: {ai_data.get('zfw', '')}")
     draw_text_next_to(p1, "(DEST/ALTN):", ai_data.get("max_ldg", ""))
-    
-    # Le Landing Weight est placé spécifiquement au-dessus du mot UPDATE
     draw_text_above(p1, "UPDATE:", f"WB: Landing Weight {ai_data.get('landing_weight', '')}")
 
-    # 2. Dessin de l'Escape Route dans un bloc de texte
+    # 2. Dessin de l'Escape Route (Insertion d'une boîte de texte multiligne)
     if ai_data.get("escape_route"):
         rects = p1.search_for("1E0 ESCAPE PROCEDURE:")
         if rects:
             r = rects[0]
-            # Création d'une boîte virtuelle en dessous du titre pour contenir le long texte
             text_rect = fitz.Rect(r.x0, r.y1 + 5, r.x0 + 350, r.y1 + 80)
             p1.insert_textbox(text_rect, ai_data["escape_route"], fontsize=8, fontname="helv", align=0)
 
-    # 3. Encadrer le Type d'Ops sélectionné par l'utilisateur (COM/PVT/TRG/MED)
+    # 3. Encadrer le Type d'Ops (COM/PVT/TRG/MED)
     ops_rects = p1.search_for(user_params["ops"])
     for r in ops_rects:
-        # On vérifie que le mot est bien dans le haut de la page (y0 < 300) pour ne pas 
-        # entourer accidentellement le mot "COM" s'il apparaît ailleurs dans un NOTAM
-        if r.y0 < 300: 
-            # On dessine un rectangle légèrement plus grand que le mot avec des bords arrondis (radius)
+        if r.y0 < 300: # Sécurise pour n'encadrer que l'en-tête, pas d'éventuels NOTAMs
             p1.draw_rect(fitz.Rect(r.x0 - 2, r.y0 - 2, r.x1 + 2, r.y1 + 2), color=red_color, width=1.5, radius=2)
 
     # 4. Encadrer dynamiquement le PF (Pilot Flying) et PM (Pilot Monitoring)
     pf_pm_rects = p1.search_for("PF-PM")
-    # On filtre pour ne garder que ceux du bloc "Temps de vol" et on les trie de gauche à droite
     pf_pm_rects = sorted([r for r in pf_pm_rects if 600 < r.y0 < 750], key=lambda x: x.x0)
     
     if len(pf_pm_rects) >= 2:
-        cpt_rect = pf_pm_rects[0] # Le premier trouvé à gauche
-        fo_rect = pf_pm_rects[1]  # Le deuxième trouvé à droite
+        cpt_rect = pf_pm_rects[0]
+        fo_rect = pf_pm_rects[1]
 
         def draw_circle(r, role):
-            """Fonction interne pour tracer une boîte soit autour du 'PF', soit autour du 'PM'."""
             w = r.x1 - r.x0
             if role == "PF": 
-                # Boîte sur la moitié gauche du texte "PF-PM"
                 box = fitz.Rect(r.x0 - 2, r.y0 - 2, r.x0 + w/2, r.y1 + 2)
             else: 
-                # Boîte sur la moitié droite du texte "PF-PM"
                 box = fitz.Rect(r.x0 + w/2, r.y0 - 2, r.x1 + 2, r.y1 + 2)
             p1.draw_rect(box, color=red_color, width=1.5, radius=3)
 
-        # Application de la sélection utilisateur
         if user_params["pf"] == "CPT":
             draw_circle(cpt_rect, "PF")
             draw_circle(fo_rect, "PM")
@@ -238,27 +188,25 @@ def draw_on_pdf(template_bytes, ai_data, user_params):
     if len(doc) > 1:
         p2 = doc[1]
         
-        # 5. Drift Down : On l'écrit à droite du point "-TOC-"
+        # 5. Drift Down (Aligné à droite de la mention -TOC-)
         if user_params.get("driftdown_fl"):
             draw_text_next_to(p2, "-TOC-", f"DD: FL {user_params['driftdown_fl']}", offset_x=15, color=red_color)
 
-        # 6. Recherche de la MORA Maximum pour l'altitude de Recovery
+        # 6. Recherche et calcul de la Recovery Altitude (Basé sur la plus haute MORA)
         words = p2.get_text("words")
         max_mora, max_mora_rect = 0, None
         for w in words:
             text = w[4]
-            # La MORA est généralement un nombre entre 50 et 250 (soit 5000ft à 25000ft)
             if text.isdigit() and 50 <= int(text) <= 250:
                 if int(text) > max_mora:
                     max_mora = int(text)
-                    max_mora_rect = fitz.Rect(w[:4]) # On sauvegarde la position de la plus haute
+                    max_mora_rect = fitz.Rect(w[:4])
                     
-        # Écriture de la Recovery Altitude à côté de la MORA la plus haute
         if max_mora_rect:
             recovery_alt = (max_mora * 100) + 1000
             p2.insert_text((max_mora_rect.x1 + 20, max_mora_rect.y1), f"Rec: {recovery_alt} FT", fontsize=10, fontname="hebo", color=red_color)
 
-    # ------------------ SAUVEGARDE EN MÉMOIRE ------------------
+    # ------------------ EXPORTATION ------------------
     output = io.BytesIO()
     doc.save(output)
     doc.close()
@@ -287,26 +235,26 @@ with col_ops:
 with col_dd: 
     driftdown_fl = st.text_input("Drift Down FL :", placeholder="ex: 220")
 
-# Bouton d'action principal
+# Bouton de lancement
 if st.button("🚀 Analyser avec l'IA & Compléter l'OFP", type="primary", use_container_width=True):
     
-    # Vérification vitale 1 : Clé API
+    # Validation de la clé API Groq
     try:
-        api_key = st.secrets["GEMINI_API_KEY"]
+        api_key = st.secrets["GROQ_API_KEY"]
     except Exception:
-        st.error("⚠️ La clé API n'est pas configurée dans les Secrets de Streamlit.")
+        st.error("⚠️ La clé API Groq n'est pas configurée.")
+        st.info("Ajoutez 'GROQ_API_KEY = \"votre_cle\"' dans les Secrets de Streamlit.")
         st.stop()
 
-    # Vérification vitale 2 : Présence des fichiers
     if not (fp_file and wb_file and template_file):
         st.warning("⚠️ Veuillez charger les 3 documents PDF avant de lancer l'analyse.")
     else:
-        with st.spinner("Extraction, analyse sémantique (IA) et tracé géométrique en cours..."):
+        with st.spinner("Extraction, analyse sémantique (Groq IA) et tracé géométrique en cours..."):
             
-            # --- Étape A : Lecture des fichiers ---
+            # --- Étape A : Lecture des fichiers PDF ---
             doc_wb = fitz.open(stream=wb_file.read(), filetype="pdf")
             wb_text = " ".join([page.get_text() for page in doc_wb])
-            wb_text = " ".join(wb_text.split()) # Nettoyage
+            wb_text = " ".join(wb_text.split())
             doc_wb.close()
             
             fp_text = extract_text_from_fp(fp_file)
@@ -317,17 +265,16 @@ if st.button("🚀 Analyser avec l'IA & Compléter l'OFP", type="primary", use_c
             if ai_data:
                 st.success("✅ Données extraites de l'APG et du W&B avec succès !")
                 
-                # Optionnel : Afficher ce que l'IA a compris pour vérification par l'équipage
                 with st.expander("🔍 Vérifier les données brutes extraites"):
                     st.json(ai_data)
                 
-                # --- Étape C : Tracé sur le PDF ---
+                # --- Étape C : Tracé final ---
                 user_params = {"pf": pf, "ops": ops, "driftdown_fl": driftdown_fl}
                 template_bytes = template_file.read()
                 
                 final_pdf = draw_on_pdf(template_bytes, ai_data, user_params)
 
-                # --- Étape D : Bouton de téléchargement final ---
+                # --- Étape D : Téléchargement ---
                 st.download_button(
                     label="📥 Télécharger l'OFP Complété pour le vol",
                     data=final_pdf,
